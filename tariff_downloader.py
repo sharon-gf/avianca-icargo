@@ -234,6 +234,9 @@ def init_selenium_driver(config: DownloaderConfig) -> webdriver.Chrome:
     chrome_binary = find_chrome_binary()
     if chrome_binary:
         chrome_options.binary_location = chrome_binary
+        logger.info("Using Chrome binary: %s", chrome_binary)
+    else:
+        logger.warning("No Chrome binary found on PATH; Selenium will try its defaults")
 
     prefs = {
         "download.default_directory": str(config.download_dir),
@@ -245,6 +248,14 @@ def init_selenium_driver(config: DownloaderConfig) -> webdriver.Chrome:
     chrome_options.add_experimental_option("prefs", prefs)
 
     driver_path = os.getenv("CHROMEDRIVER_PATH") or shutil.which("chromedriver")
+    if driver_path:
+        logger.info("Using ChromeDriver: %s", driver_path)
+    elif any(name.startswith("RAILWAY_") for name in os.environ):
+        raise RuntimeError(
+            "chromedriver was not found on Railway's PATH. "
+            "Redeploy with the updated nixpacks.toml so Railway installs system chromedriver."
+        )
+
     service = Service(driver_path) if driver_path else None
 
     logger.info("Initializing Chrome WebDriver")
