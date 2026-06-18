@@ -74,7 +74,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v7-newest-code-email"
+DOWNLOADER_BUILD_VERSION = "job-api-v8-body-code-email"
 VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
 
 ProgressCallback = Callable[[str, int | None], None]
@@ -324,7 +324,7 @@ def get_verification_code_from_email(
                 )
                 emit(progress_callback, f"Checking {len(email_ids)} Microsoft email candidate(s)", 12)
 
-                candidates = []
+                code_candidates = []
                 for email_id in email_ids[-100:]:
                     status, msg_data = mail.fetch(email_id, "(RFC822)")
                     if status != "OK" or not msg_data:
@@ -335,36 +335,46 @@ def get_verification_code_from_email(
                     if not email_date:
                         continue
 
-                    subject = email_subject(msg)
-                    if VERIFICATION_SUBJECT_FRAGMENT not in subject.lower():
+                    body = extract_email_body(msg)
+                    code = extract_verification_code(body)
+                    if not code:
                         continue
 
-                    candidates.append((email_date, msg))
+                    subject = email_subject(msg)
+                    code_candidates.append((email_date, code, subject))
 
-                candidates.sort(key=lambda item: item[0], reverse=True)
-                newest_seen = candidates[0][0] if candidates else None
+                code_candidates.sort(key=lambda item: item[0], reverse=True)
+                newest_seen = code_candidates[0][0] if code_candidates else None
+                if code_candidates:
+                    emit(
+                        progress_callback,
+                        f"Found {len(code_candidates)} Microsoft email(s) containing a code",
+                        12,
+                    )
 
-                for email_date, msg in candidates:
+                for email_date, code, subject in code_candidates:
                     if email_date < requested_after - timedelta(minutes=10):
                         logger.debug("Stopping at old candidate email: %s", email_date.isoformat())
                         break
 
-                    body = extract_email_body(msg)
-                    code = extract_verification_code(body)
-                    if code:
-                        mail.close()
-                        mail.logout()
-                        logger.info("Verification code found from email dated %s", email_date.isoformat())
-                        emit(progress_callback, f"Verification code found from {email_date.strftime('%H:%M:%S')}", 14)
-                        return code
-                    logger.debug("Candidate email passed date filter but no code pattern matched")
+                    mail.close()
+                    mail.logout()
+                    logger.info(
+                        "Verification code found from email dated %s with subject %s",
+                        email_date.isoformat(),
+                        subject,
+                    )
+                    emit(progress_callback, f"Verification code found from {email_date.strftime('%H:%M:%S')}", 14)
+                    return code
 
                 if newest_seen:
                     emit(
                         progress_callback,
-                        f"Newest matching verification email is from {newest_seen.strftime('%H:%M:%S')}; waiting for newer code",
+                        f"Newest code email is from {newest_seen.strftime('%H:%M:%S')}; waiting for newer code",
                         12,
                     )
+                else:
+                    emit(progress_callback, "No code found inside Microsoft email candidates yet", 12)
 
             elapsed = time.time() - start_time
             if elapsed - last_search_window_change > 30 and current_window_idx < len(time_windows) - 1:
