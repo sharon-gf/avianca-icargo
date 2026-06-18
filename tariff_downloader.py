@@ -17,7 +17,32 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from tariff_downloader import DEFAULT_AIRPORTS, MAX_RANGE_DAYS, run_download_workflow
+DEFAULT_AIRPORTS = [
+    "CAN",
+    "HKG",
+    "NGO",
+    "ISB",
+    "XMN",
+    "CGK",
+    "ICN",
+    "TPE",
+    "CGO",
+    "DPS",
+    "GMP",
+    "HAN",
+    "PEK",
+    "NRT",
+    "MFM",
+    "SGN",
+    "PVG",
+    "HND",
+    "KHI",
+    "DAD",
+    "SZX",
+    "KIX",
+    "LHE",
+]
+MAX_RANGE_DAYS = 15
 
 
 logging.basicConfig(level=logging.INFO)
@@ -35,6 +60,7 @@ JOBS: dict[str, dict] = {}
 # Use one worker because the same iCargo/Gmail login should not run multiple MFA
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
+CLIENT_VERSION = "job-api-v2"
 
 
 def now_iso() -> str:
@@ -87,6 +113,7 @@ def public_job(job: dict) -> dict:
         "endDate": job["end_date"],
         "error": job.get("error"),
         "result": job.get("result"),
+        "cancelRequested": bool(job.get("cancel_requested")),
     }
     if job["status"] == "completed":
         response["downloadUrl"] = f"/api/jobs/{job['id']}/file"
@@ -95,7 +122,7 @@ def public_job(job: dict) -> dict:
 
 def find_active_job_locked() -> dict | None:
     for job in JOBS.values():
-        if job["status"] in {"queued", "running"}:
+        if job["status"] in {"queued", "running", "cancelling"}:
             return job
     return None
 
@@ -106,7 +133,7 @@ def cleanup_old_jobs() -> None:
 
     with JOB_LOCK:
         for job_id, job in list(JOBS.items()):
-            if job["status"] in {"queued", "running"}:
+            if job["status"] in {"queued", "running", "cancelling"}:
                 continue
             updated_at = datetime.fromisoformat(job["updated_at"])
             if updated_at < cutoff:
@@ -117,9 +144,23 @@ def cleanup_old_jobs() -> None:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@app.after_request
+def disable_response_cache(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 def run_job(job_id: str) -> None:
     with JOB_LOCK:
         job = JOBS[job_id]
+        if job.get("cancel_requested"):
+            job["status"] = "cancelled"
+            job["progress"] = 0
+            job["updated_at"] = now_iso()
+            return
+
         job["status"] = "running"
         job["progress"] = 1
         job["updated_at"] = now_iso()
@@ -127,10 +168,13 @@ def run_job(job_id: str) -> None:
         start_date = job["start_date"]
         end_date = job["end_date"]
         download_dir = Path(job["download_dir"])
+        cancel_event = job["cancel_event"]
 
     add_job_log(job_id, "Job started", 1)
 
     try:
+        from tariff_downloader import run_download_workflow
+
         result = run_download_workflow(
             airports=airports,
             start_date=start_date,
@@ -139,10 +183,16 @@ def run_job(job_id: str) -> None:
             upload_dropbox=env_flag("UPLOAD_TO_DROPBOX"),
             send_email=env_flag("SEND_NOTIFICATION_EMAIL"),
             progress_callback=lambda message, progress=None: add_job_log(job_id, message, progress),
+            cancel_callback=cancel_event.is_set,
         )
 
         with JOB_LOCK:
             job = JOBS[job_id]
+            if job.get("cancel_requested"):
+                job["status"] = "cancelled"
+                job["updated_at"] = now_iso()
+                return
+
             job["status"] = "completed"
             job["progress"] = 100
             job["result"] = {
@@ -158,10 +208,17 @@ def run_job(job_id: str) -> None:
         logger.exception("Job %s failed", job_id)
         with JOB_LOCK:
             job = JOBS[job_id]
-            job["status"] = "failed"
-            job["error"] = str(exc)
+            if job.get("cancel_requested"):
+                job["status"] = "cancelled"
+                job["error"] = None
+            else:
+                job["status"] = "failed"
+                job["error"] = str(exc)
             job["updated_at"] = now_iso()
-        add_job_log(job_id, f"Job failed: {exc}")
+        if cancel_event.is_set():
+            add_job_log(job_id, "Job cancelled")
+        else:
+            add_job_log(job_id, f"Job failed: {exc}")
 
 
 @app.route("/")
@@ -183,6 +240,12 @@ def start_download():
 
     try:
         data = request.get_json(silent=True) or {}
+        if request.headers.get("X-Client-Version") != CLIENT_VERSION:
+            return (
+                jsonify({"error": "Please refresh the page before starting a download."}),
+                426,
+            )
+
         module = data.get("module", "TRF007")
         airports = [str(code).strip().upper() for code in data.get("airports", []) if str(code).strip()]
         start_date = data.get("startDate")
@@ -223,6 +286,7 @@ def start_download():
             work_dir = TEMP_DIR / job_id
             download_dir = work_dir / "files"
             download_dir.mkdir(parents=True, exist_ok=True)
+            cancel_event = threading.Event()
 
             JOBS[job_id] = {
                 "id": job_id,
@@ -239,10 +303,13 @@ def start_download():
                 "file_path": None,
                 "result": None,
                 "error": None,
+                "cancel_requested": False,
+                "cancel_event": cancel_event,
+                "future": None,
             }
 
-        EXECUTOR.submit(run_job, job_id)
         with JOB_LOCK:
+            JOBS[job_id]["future"] = EXECUTOR.submit(run_job, job_id)
             job = public_job(JOBS[job_id])
         return jsonify(job), 202
 
@@ -260,6 +327,31 @@ def get_job(job_id: str):
         if not job:
             return jsonify({"error": "Job not found"}), 404
         return jsonify(public_job(job))
+
+
+@app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
+def cancel_job(job_id: str):
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+
+        if job["status"] in {"completed", "failed", "cancelled"}:
+            return jsonify(public_job(job))
+
+        job["cancel_requested"] = True
+        job["cancel_event"].set()
+        future = job.get("future")
+        if job["status"] == "queued" and future and future.cancel():
+            job["status"] = "cancelled"
+        else:
+            job["status"] = "cancelling"
+
+        job["updated_at"] = now_iso()
+
+    add_job_log(job_id, "Abort requested")
+    with JOB_LOCK:
+        return jsonify(public_job(JOBS[job_id]))
 
 
 @app.route("/api/jobs/<job_id>/file")
