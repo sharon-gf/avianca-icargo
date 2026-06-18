@@ -60,6 +60,7 @@ JOBS: dict[str, dict] = {}
 # Use one worker because the same iCargo/Gmail login should not run multiple MFA
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
+CLIENT_VERSION = "job-api-v2"
 
 
 def now_iso() -> str:
@@ -142,6 +143,14 @@ def cleanup_old_jobs() -> None:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@app.after_request
+def disable_response_cache(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
 def run_job(job_id: str) -> None:
     from tariff_downloader import run_download_workflow
 
@@ -210,6 +219,12 @@ def start_download():
 
     try:
         data = request.get_json(silent=True) or {}
+        if request.headers.get("X-Client-Version") != CLIENT_VERSION:
+            return (
+                jsonify({"error": "Please refresh the page before starting a download."}),
+                426,
+            )
+
         module = data.get("module", "TRF007")
         airports = [str(code).strip().upper() for code in data.get("airports", []) if str(code).strip()]
         start_date = data.get("startDate")
