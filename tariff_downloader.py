@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -73,7 +73,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v2-downloader"
+DOWNLOADER_BUILD_VERSION = "job-api-v4-email-search"
 
 ProgressCallback = Callable[[str, int | None], None]
 CancelCallback = Callable[[], bool]
@@ -277,6 +277,7 @@ def get_verification_code_from_email(
     config: DownloaderConfig,
     timeout_seconds: int = 300,
     cancel_callback: CancelCallback | None = None,
+    requested_after: datetime | None = None,
 ) -> str:
     logger.info("Waiting for verification code email")
     mail = None
@@ -287,6 +288,11 @@ def get_verification_code_from_email(
         mail.select("INBOX")
 
         start_time = time.time()
+        if requested_after is None:
+            requested_after = datetime.now(timezone.utc) - timedelta(seconds=30)
+        elif requested_after.tzinfo is None:
+            requested_after = requested_after.replace(tzinfo=timezone.utc)
+
         time_windows = [30, 60, 120, 240]
         current_window_idx = 0
         last_search_window_change = start_time
@@ -299,7 +305,6 @@ def get_verification_code_from_email(
 
             status, messages = mail.search(
                 None,
-                "UNSEEN",
                 "FROM",
                 config.verification_code_sender,
                 "SINCE",
@@ -308,13 +313,21 @@ def get_verification_code_from_email(
 
             if status == "OK" and messages and messages[0]:
                 email_ids = messages[0].split()
+                logger.info(
+                    "Found %s candidate verification email(s), checking newest first",
+                    len(email_ids),
+                )
                 for email_id in reversed(email_ids[-50:]):
                     status, msg_data = mail.fetch(email_id, "(RFC822)")
                     if status != "OK" or not msg_data:
                         continue
 
                     msg = email.message_from_bytes(msg_data[0][1])
-                    if not email_is_recent_and_relevant(msg, config.avianca_email):
+                    if not email_is_recent_and_relevant(
+                        msg,
+                        config.avianca_email,
+                        requested_after=requested_after,
+                    ):
                         continue
 
                     body = extract_email_body(msg)
@@ -353,17 +366,39 @@ def get_verification_code_from_email(
                 pass
 
 
-def email_is_recent_and_relevant(msg: email.message.Message, avianca_email: str | None) -> bool:
+def email_is_recent_and_relevant(
+    msg: email.message.Message,
+    avianca_email: str | None,
+    requested_after: datetime,
+) -> bool:
     try:
         email_date = email.utils.parsedate_to_datetime(msg["Date"])
-        now = datetime.now(email_date.tzinfo) if email_date.tzinfo else datetime.now()
-        if (now - email_date).total_seconds() > 300:
+        if email_date.tzinfo is None:
+            email_date = email_date.replace(tzinfo=timezone.utc)
+        requested_after = requested_after.astimezone(email_date.tzinfo)
+        now = datetime.now(email_date.tzinfo)
+
+        # Accept only emails that could belong to the current Microsoft challenge.
+        if email_date < requested_after:
+            return False
+        if (now - email_date).total_seconds() > 900:
             return False
     except Exception:
         return False
 
-    email_to = msg.get("To", "")
-    return bool(avianca_email and avianca_email.lower() in email_to.lower())
+    recipient_headers = " ".join(
+        filter(
+            None,
+            [
+                msg.get("To", ""),
+                msg.get("Cc", ""),
+                msg.get("Delivered-To", ""),
+                msg.get("X-Original-To", ""),
+                msg.get("Envelope-To", ""),
+            ],
+        )
+    )
+    return bool(avianca_email and avianca_email.lower() in recipient_headers.lower())
 
 
 def extract_email_body(msg: email.message.Message) -> str:
@@ -442,6 +477,8 @@ def login_to_avianca(
             next_button = wait.until(EC.element_to_be_clickable((By.ID, "idSIButton9")))
         except TimeoutException:
             next_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Next')]")))
+
+        code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=20)
         next_button.click()
 
         time.sleep(3)
@@ -454,6 +491,7 @@ def login_to_avianca(
                     config,
                     timeout_seconds=300,
                     cancel_callback=cancel_callback,
+                    requested_after=code_requested_at,
                 )
                 break
             except TimeoutException:
@@ -788,6 +826,65 @@ def upload_to_dropbox(config: DownloaderConfig, file_path: str | Path) -> bool:
         return False
 
 
+def prepare_icargo_session(
+    config: DownloaderConfig,
+    progress_callback: ProgressCallback | None,
+    cancel_callback: CancelCallback | None,
+    max_attempts: int = 2,
+) -> webdriver.Chrome:
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        driver = None
+        try:
+            check_cancelled(cancel_callback)
+            if attempt > 1:
+                emit(progress_callback, f"Retrying Avianca login setup ({attempt}/{max_attempts})", 7)
+
+            driver = init_selenium_driver(config)
+            emit(progress_callback, "Chrome started", 8)
+
+            check_cancelled(cancel_callback)
+            if not login_to_avianca(driver, config, cancel_callback=cancel_callback):
+                raise RuntimeError("Failed to login to Avianca iCargo")
+            emit(progress_callback, "Logged in to iCargo", 18)
+
+            check_cancelled(cancel_callback)
+            if not switch_to_comm_role(driver):
+                raise RuntimeError("Failed to switch to COMM role")
+            emit(progress_callback, "Switched to COMM role", 23)
+
+            check_cancelled(cancel_callback)
+            if not navigate_to_screen(driver, "TRF007"):
+                raise RuntimeError("Failed to navigate to TRF007")
+            emit(progress_callback, "Opened TRF007", 28)
+
+            return driver
+
+        except WorkflowCancelled:
+            if driver:
+                driver.quit()
+            raise
+        except Exception as exc:
+            last_error = exc
+            logger.exception("Avianca setup attempt %s/%s failed", attempt, max_attempts)
+            emit(progress_callback, f"Avianca setup attempt {attempt}/{max_attempts} failed: {exc}", 7)
+            if driver:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+            if attempt < max_attempts:
+                for remaining in range(10, 0, -1):
+                    check_cancelled(cancel_callback)
+                    if remaining in {10, 5, 1}:
+                        emit(progress_callback, f"Retrying in {remaining}s", 7)
+                    time.sleep(1)
+
+    raise RuntimeError(f"Avianca setup failed after {max_attempts} attempts: {last_error}")
+
+
 def run_download_workflow(
     airports: Iterable[str] | None = None,
     start_date: str | date | None = None,
@@ -816,23 +913,12 @@ def run_download_workflow(
         emit(progress_callback, f"Airports selected: {', '.join(selected_airports)}", 5)
         emit(progress_callback, f"Date range: {icargo_start_date} to {icargo_end_date}", 6)
 
-        driver = init_selenium_driver(config)
-        emit(progress_callback, "Chrome started", 8)
-
-        check_cancelled(cancel_callback)
-        if not login_to_avianca(driver, config, cancel_callback=cancel_callback):
-            raise RuntimeError("Failed to login to Avianca iCargo")
-        emit(progress_callback, "Logged in to iCargo", 18)
-
-        check_cancelled(cancel_callback)
-        if not switch_to_comm_role(driver):
-            raise RuntimeError("Failed to switch to COMM role")
-        emit(progress_callback, "Switched to COMM role", 23)
-
-        check_cancelled(cancel_callback)
-        if not navigate_to_screen(driver, "TRF007"):
-            raise RuntimeError("Failed to navigate to TRF007")
-        emit(progress_callback, "Opened TRF007", 28)
+        driver = prepare_icargo_session(
+            config=config,
+            progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+            max_attempts=2,
+        )
 
         total_airports = len(selected_airports)
         for index, airport in enumerate(selected_airports, start=1):
