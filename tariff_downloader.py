@@ -342,10 +342,12 @@ def init_selenium_driver():
     chrome_options.add_experimental_option("prefs", prefs)
     
     try:
+        logger.info("Initializing Chrome WebDriver...")
         driver = webdriver.Chrome(options=chrome_options)
-    except:
-        # Fallback if webdriver-manager doesn't work
-        driver = webdriver.Chrome(options=chrome_options)
+        logger.info("✓ Chrome WebDriver initialized successfully")
+    except Exception as e:
+        logger.error(f"Chrome initialization failed: {str(e)}", exc_info=True)
+        raise
     
     driver.set_page_load_timeout(30)
     return driver
@@ -359,6 +361,7 @@ def login_to_avianca(driver) -> bool:
     """
     try:
         logger.info("Navigating to Avianca iCargo login page...")
+        logger.info(f"Driver created successfully, navigating to {CONFIG['avianca_url']}")
         driver.get(CONFIG["avianca_url"])
         
         wait = WebDriverWait(driver, 15)
