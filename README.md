@@ -1,96 +1,115 @@
-# Avianca iCargo Tariff Downloader - Web Portal
+# Avianca iCargo TRF007 Web Downloader
 
-A web interface for downloading and merging tariff data from Avianca iCargo.
+A Flask web app that runs the Avianca iCargo TRF007 Selenium workflow as a background job, merges the exported Excel files, and returns one downloadable workbook.
 
-## Features
+## What changed
 
-- 🌐 Web-based interface (no terminal needed)
-- ✈️ Select specific airports or all 27
-- 📅 Choose date ranges
-- 📊 Automatic file merging
-- ☁️ Deploy to Railway in 2 minutes
+- The web UI starts a background job instead of waiting on one long request.
+- The page polls progress logs while Selenium runs.
+- A running job can be cancelled with the Abort button.
+- The fragile browser/login/TRF007 setup stage automatically retries once.
+- Microsoft verification email search checks recent read and unread messages from the current challenge window.
+- Selected airports and dates are passed into the downloader.
+- Each job gets its own isolated download folder.
+- Credentials are read from environment variables, not from source code.
+- The merged file is served from `/api/jobs/<job_id>/file` when ready.
 
-## Setup for Railway
+## Required environment variables
 
-### 1. Create GitHub repo
-
-```bash
-cd avianca-web
-git init
-git add .
-git commit -m "Initial commit"
-git remote add origin https://github.com/YOUR_USERNAME/avianca-web.git
-git push -u origin main
-```
-
-### 2. Deploy to Railway
-
-1. Go to [Railway.app](https://railway.app)
-2. Click "New Project"
-3. Select "Deploy from GitHub repo"
-4. Select `avianca-web` repo
-5. Railway will auto-detect Flask and deploy!
-
-### 3. Configure environment variables in Railway
-
-In Railway dashboard, add these variables:
-
-```
-AVIANCA_EMAIL=ldiaz@gocargogsa.com
-GMAIL_PASSWORD=ayph ojlv hnrt osme
-DROPBOX_TOKEN=your_dropbox_token
-```
-
-### 4. Your team visits the URL
-
-Railway gives you a URL like: `https://avianca-web-production.up.railway.app`
-
-Your team opens it in a browser, selects airports/dates, clicks download!
-
-## Local development
+Set these locally in `.env` or directly in Railway:
 
 ```bash
-python -m venv venv
-source venv/bin/activate  # or: venv\Scripts\activate on Windows
+AVIANCA_EMAIL=your-avianca-login@example.com
+GMAIL_EMAIL=your-code-inbox@example.com
+GMAIL_APP_PASSWORD=your-gmail-app-password
+```
+
+Optional:
+
+```bash
+HEADLESS=true
+UPLOAD_TO_DROPBOX=false
+DROPBOX_TOKEN=
+DROPBOX_UPLOAD_PATH=/Cargo_Bookings
+SEND_NOTIFICATION_EMAIL=false
+JOB_TTL_HOURS=6
+```
+
+Use a Gmail app password, not your normal Gmail password.
+
+## Local setup
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+```
+
+Edit `.env`, then run:
+
+```bash
+set -a
+source .env
+set +a
 python app.py
 ```
 
-Then visit: `http://localhost:5000`
+Open `http://localhost:5000`.
 
-## How it works
+## Local CLI test
 
-1. User selects module, airports, and date range in the web interface
-2. Flask backend receives the request
-3. Calls `tariff_downloader.py` with those parameters
-4. Downloader logs into Avianca, downloads tariffs for selected airports
-5. Files are merged into one Excel file
-6. File is sent to user's computer as download
+You can test the downloader without the web page:
 
-## File structure
-
-```
-avianca-web/
-├── app.py                    # Flask backend
-├── tariff_downloader.py      # Your existing downloader script
-├── requirements.txt          # Python dependencies
-├── railway.toml             # Railway config
-├── templates/
-│   └── index.html           # Web interface
-└── .gitignore
+```bash
+set -a
+source .env
+set +a
+python tariff_downloader.py run --airports HKG,MFM,XMN --start-date 2026-06-18 --end-date 2026-07-03 --download-dir /tmp/avianca-test
 ```
 
-## Troubleshooting
+## Railway deployment
 
-**"Chrome driver not found"** → Railway needs Chromium installed. This is handled automatically by nixpacks.
+1. Push this folder to GitHub.
+2. Create a Railway project from the GitHub repo.
+3. Add the required environment variables in Railway.
+4. Deploy.
 
-**"Email verification times out"** → Check GMAIL_PASSWORD and IMAP settings
+This project includes a `Dockerfile`. Railway should use it automatically. That is preferred over Nixpacks because Selenium needs a matching Chromium and ChromeDriver inside the same Linux image.
 
-**"Large files timeout"** → Railway has 120s timeout. You may need to increase or use async.
+After deploying, check:
 
-## Next steps
+```text
+https://YOUR_DOMAIN/api/diagnostics
+```
 
-- Add support for other modules (BKG001, AWB001, etc.)
-- Add authentication for your team
-- Add download history/logging
-- Store merged files in cloud storage (Dropbox, S3)
+The Chrome section should show non-empty `chromiumPath` and `chromedriverPath`.
+
+The `Procfile` uses:
+
+```bash
+python app.py
+```
+
+The app reads Railway's `PORT` value automatically.
+
+## Important security cleanup
+
+If real Gmail, Avianca, or Dropbox credentials were ever committed or shared, rotate them before deploying:
+
+- Create a new Gmail app password.
+- Revoke the exposed Dropbox token.
+- Replace Railway/GitHub secrets with the new values.
+- Remove old secrets from any public GitHub history if the repo was already pushed.
+
+## Notes
+
+- TRF007 is limited to a 15-day date range.
+- Only one job runs at a time because the same account/MFA inbox is shared.
+- Abort is cooperative: it stops at the next safe browser/email/download checkpoint.
+- A cold Railway container or first Microsoft verification challenge may fail once; the app retries that setup stage automatically.
+- If Gmail marks the Microsoft code email as read immediately, the app should still find it.
+- The Gmail code search does not depend on recipient headers, which can be missing or rewritten by mail routing.
+- Completed job files are kept for `JOB_TTL_HOURS`, then cleaned up when a new job starts.
+- If ChromeDriver exits with status code `127`, Railway is missing a runnable system ChromeDriver. Redeploy with the included `nixpacks.toml` and check `/api/diagnostics`.
+- If ChromeDriver exits with status code `127`, Railway is still not using the Docker image or system ChromeDriver correctly. Make sure the repo contains `Dockerfile`, then redeploy from the latest commit.

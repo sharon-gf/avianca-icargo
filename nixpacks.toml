@@ -27,4 +27,6 @@ onlyIncludeFiles = [
     "runtime.txt",
     "railway.toml",
     "nixpacks.toml",
+    "Dockerfile",
+    ".dockerignore",
 ]

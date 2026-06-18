@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import email
+import email.header
 import imaplib
 import json
 import logging
@@ -73,7 +74,8 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v5-login-progress"
+DOWNLOADER_BUILD_VERSION = "job-api-v7-newest-code-email"
+VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
 
 ProgressCallback = Callable[[str, int | None], None]
 CancelCallback = Callable[[], bool]
@@ -321,31 +323,48 @@ def get_verification_code_from_email(
                     len(email_ids),
                 )
                 emit(progress_callback, f"Checking {len(email_ids)} Microsoft email candidate(s)", 12)
-                for email_id in reversed(email_ids[-50:]):
+
+                candidates = []
+                for email_id in email_ids[-100:]:
                     status, msg_data = mail.fetch(email_id, "(RFC822)")
                     if status != "OK" or not msg_data:
                         continue
 
                     msg = email.message_from_bytes(msg_data[0][1])
-                    if not email_is_recent_and_relevant(
-                        msg,
-                        config.avianca_email,
-                        requested_after=requested_after,
-                    ):
+                    email_date = parse_email_date(msg)
+                    if not email_date:
                         continue
+
+                    subject = email_subject(msg)
+                    if VERIFICATION_SUBJECT_FRAGMENT not in subject.lower():
+                        continue
+
+                    candidates.append((email_date, msg))
+
+                candidates.sort(key=lambda item: item[0], reverse=True)
+                newest_seen = candidates[0][0] if candidates else None
+
+                for email_date, msg in candidates:
+                    if email_date < requested_after - timedelta(minutes=10):
+                        logger.debug("Stopping at old candidate email: %s", email_date.isoformat())
+                        break
 
                     body = extract_email_body(msg)
                     code = extract_verification_code(body)
                     if code:
-                        try:
-                            mail.store(email_id, "+FLAGS", "\\Seen")
-                        except Exception:
-                            pass
                         mail.close()
                         mail.logout()
-                        logger.info("Verification code found")
-                        emit(progress_callback, "Verification code found", 14)
+                        logger.info("Verification code found from email dated %s", email_date.isoformat())
+                        emit(progress_callback, f"Verification code found from {email_date.strftime('%H:%M:%S')}", 14)
                         return code
+                    logger.debug("Candidate email passed date filter but no code pattern matched")
+
+                if newest_seen:
+                    emit(
+                        progress_callback,
+                        f"Newest matching verification email is from {newest_seen.strftime('%H:%M:%S')}; waiting for newer code",
+                        12,
+                    )
 
             elapsed = time.time() - start_time
             if elapsed - last_search_window_change > 30 and current_window_idx < len(time_windows) - 1:
@@ -372,39 +391,26 @@ def get_verification_code_from_email(
                 pass
 
 
-def email_is_recent_and_relevant(
-    msg: email.message.Message,
-    avianca_email: str | None,
-    requested_after: datetime,
-) -> bool:
+def parse_email_date(msg: email.message.Message) -> datetime | None:
     try:
         email_date = email.utils.parsedate_to_datetime(msg["Date"])
         if email_date.tzinfo is None:
             email_date = email_date.replace(tzinfo=timezone.utc)
-        requested_after = requested_after.astimezone(email_date.tzinfo)
-        now = datetime.now(email_date.tzinfo)
-
-        # Accept only emails that could belong to the current Microsoft challenge.
-        if email_date < requested_after:
-            return False
-        if (now - email_date).total_seconds() > 900:
-            return False
+        return email_date
     except Exception:
-        return False
+        return None
 
-    recipient_headers = " ".join(
-        filter(
-            None,
-            [
-                msg.get("To", ""),
-                msg.get("Cc", ""),
-                msg.get("Delivered-To", ""),
-                msg.get("X-Original-To", ""),
-                msg.get("Envelope-To", ""),
-            ],
-        )
-    )
-    return bool(avianca_email and avianca_email.lower() in recipient_headers.lower())
+
+def email_subject(msg: email.message.Message) -> str:
+    raw_subject = msg.get("Subject", "")
+    decoded_parts = email.header.decode_header(raw_subject)
+    parts = []
+    for value, charset in decoded_parts:
+        if isinstance(value, bytes):
+            parts.append(value.decode(charset or "utf-8", errors="ignore"))
+        else:
+            parts.append(value)
+    return "".join(parts)
 
 
 def extract_email_body(msg: email.message.Message) -> str:
@@ -428,16 +434,19 @@ def extract_email_body(msg: email.message.Message) -> str:
 
 def extract_verification_code(body: str) -> str | None:
     patterns = [
+        r"Account verification code:\s*(\d{6,8})",
         r"\b(\d{8})\b",
+        r"\b(\d{6})\b",
         r"(\d{4}[-\s]?\d{4})",
-        r"code[:\s]+(\d{4,8})",
+        r"code(?: is)?[:\s]+(\d{6,8})",
+        r"security code[:\s]+(\d{6,8})",
     ]
     for pattern in patterns:
         match = re.search(pattern, body, re.IGNORECASE)
         if match:
             code = re.sub(r"\D", "", match.group(1))
-            if len(code) >= 8:
-                return code[:8]
+            if len(code) in {6, 8}:
+                return code
     return None
 
 
