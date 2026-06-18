@@ -1,0 +1,21 @@
+[build]
+[build.variables]
+NIXPACKS_METADATA = "python"
+
+[build.nixpkgs]
+packages = [
+    "python310",
+    "chromium",
+    "libxkbcommon",
+    "libxcb",
+    "gcc",
+]
+
+[build.onlyIncludeFiles]
+paths = [
+    "app.py",
+    "tariff_downloader.py",
+    "requirements.txt",
+    "templates/",
+    "Procfile",
+]
