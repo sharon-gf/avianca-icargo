@@ -257,6 +257,17 @@ def status():
     return jsonify({"status": "ok", "timestamp": now_iso(), "activeJobId": active_job_id})
 
 
+@app.route("/api/version")
+def version():
+    return jsonify(
+        {
+            "appBuildVersion": APP_BUILD_VERSION,
+            "clientVersion": CLIENT_VERSION,
+            "routes": registered_routes(),
+        }
+    )
+
+
 @app.route("/api/diagnostics")
 def diagnostics():
     downloader_info = {
@@ -321,6 +332,10 @@ def binary_diagnostics() -> dict:
         "chromedriverPath": chromedriver_path,
         "chromedriverVersion": command_version(chromedriver_path),
     }
+
+
+def registered_routes() -> list[str]:
+    return sorted(rule.rule for rule in app.url_map.iter_rules())
 
 
 @app.route("/api/download", methods=["POST"])
@@ -470,7 +485,16 @@ def download_job_file(job_id: str):
 
 @app.errorhandler(404)
 def not_found(_):
-    return jsonify({"error": "Not found"}), 404
+    return (
+        jsonify(
+            {
+                "error": "Not found",
+                "appBuildVersion": APP_BUILD_VERSION,
+                "routes": registered_routes(),
+            }
+        ),
+        404,
+    )
 
 
 @app.errorhandler(500)
@@ -482,4 +506,6 @@ def server_error(error):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     logger.info("Starting on port %s", port)
+    logger.info("App build version: %s", APP_BUILD_VERSION)
+    logger.info("Registered routes: %s", ", ".join(registered_routes()))
     app.run(host="0.0.0.0", port=port, debug=False)
