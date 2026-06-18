@@ -3,257 +3,371 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Avianca Tariff Downloader</title>
+    <title>Avianca TRF007 Downloader</title>
     <style>
         * {
+            box-sizing: border-box;
             margin: 0;
             padding: 0;
-            box-sizing: border-box;
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
             min-height: 100vh;
-            padding: 20px;
+            background: #eef2f6;
+            color: #172033;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            padding: 24px;
         }
 
-        .container {
-            max-width: 600px;
+        .shell {
+            max-width: 980px;
             margin: 0 auto;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
-            padding: 40px;
+        }
+
+        header {
+            margin-bottom: 18px;
         }
 
         h1 {
             font-size: 28px;
-            margin-bottom: 10px;
-            color: #1a1a1a;
+            font-weight: 700;
+            letter-spacing: 0;
         }
 
         .subtitle {
-            color: #666;
-            margin-bottom: 30px;
+            color: #5b667a;
             font-size: 14px;
+            margin-top: 4px;
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) 360px;
+            gap: 18px;
+            align-items: start;
+        }
+
+        .panel {
+            background: #ffffff;
+            border: 1px solid #d8dee8;
+            border-radius: 8px;
+            padding: 22px;
+            box-shadow: 0 10px 30px rgba(20, 35, 60, 0.08);
         }
 
         .form-group {
-            margin-bottom: 24px;
+            margin-bottom: 22px;
         }
 
         label {
             display: block;
-            font-weight: 500;
+            font-size: 14px;
+            font-weight: 650;
             margin-bottom: 8px;
-            color: #1a1a1a;
-            font-size: 14px;
         }
 
-        select, input[type="date"] {
+        select,
+        input[type="date"] {
             width: 100%;
-            padding: 10px 12px;
-            border: 1px solid #ddd;
+            min-height: 40px;
+            border: 1px solid #cbd3df;
             border-radius: 6px;
+            background: #ffffff;
+            color: #172033;
+            font: inherit;
             font-size: 14px;
-            font-family: inherit;
+            padding: 8px 10px;
         }
 
-        select:focus, input[type="date"]:focus {
+        select:focus,
+        input[type="date"]:focus {
+            border-color: #1b66d2;
+            box-shadow: 0 0 0 3px rgba(27, 102, 210, 0.14);
             outline: none;
-            border-color: #0066cc;
-            box-shadow: 0 0 0 3px rgba(0, 102, 204, 0.1);
         }
 
-        .button-group {
+        .button-row {
             display: flex;
             gap: 8px;
-            margin-bottom: 8px;
+            margin-bottom: 10px;
         }
 
-        .button-group button {
-            flex: 1;
-            padding: 8px 12px;
-            background: #f0f0f0;
-            border: 1px solid #ddd;
+        button {
+            min-height: 38px;
+            border: 1px solid #b9c4d3;
             border-radius: 6px;
+            background: #ffffff;
+            color: #172033;
             cursor: pointer;
-            font-size: 13px;
-            font-weight: 500;
-            transition: all 0.2s;
+            font: inherit;
+            font-size: 14px;
+            font-weight: 650;
+            padding: 8px 12px;
         }
 
-        .button-group button:hover {
-            background: #e8e8e8;
-            border-color: #ccc;
+        button:hover:not(:disabled) {
+            background: #f4f7fb;
+        }
+
+        button:disabled {
+            cursor: not-allowed;
+            opacity: 0.55;
+        }
+
+        .primary-btn {
+            width: 100%;
+            min-height: 46px;
+            background: #b4172a;
+            border-color: #b4172a;
+            color: #ffffff;
+        }
+
+        .primary-btn:hover:not(:disabled) {
+            background: #941323;
+        }
+
+        .download-link {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 100%;
+            min-height: 42px;
+            border-radius: 6px;
+            background: #1f7a4d;
+            color: #ffffff;
+            font-size: 14px;
+            font-weight: 700;
+            text-decoration: none;
         }
 
         .airports-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(60px, 1fr));
+            grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
             gap: 8px;
-            padding: 12px;
-            background: #f9f9f9;
-            border: 1px solid #ddd;
-            border-radius: 6px;
-            max-height: 200px;
+            max-height: 220px;
             overflow-y: auto;
+            border: 1px solid #d8dee8;
+            border-radius: 8px;
+            background: #f8fafc;
+            padding: 12px;
         }
 
         .airport-label {
             display: flex;
             align-items: center;
-            gap: 6px;
+            gap: 7px;
+            min-height: 30px;
+            color: #283449;
             cursor: pointer;
             font-size: 13px;
+            font-weight: 600;
             user-select: none;
         }
 
-        .airport-label input[type="checkbox"] {
-            cursor: pointer;
-            width: 14px;
-            height: 14px;
+        .airport-label input {
+            width: 15px;
+            height: 15px;
+            accent-color: #b4172a;
         }
 
         .selected-count {
-            font-size: 12px;
-            color: #666;
             margin-top: 8px;
+            color: #5b667a;
+            font-size: 13px;
         }
 
-        .date-group {
+        .date-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 12px;
         }
 
-        .download-btn {
-            width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, #0066cc 0%, #004499 100%);
-            color: white;
-            border: none;
-            border-radius: 6px;
-            font-size: 15px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.3s;
-            margin-top: 10px;
-        }
-
-        .download-btn:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(0, 102, 204, 0.3);
-        }
-
-        .download-btn:active {
-            transform: translateY(0);
-        }
-
-        .download-btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-
-        .status-message {
-            margin-top: 16px;
-            padding: 12px;
-            border-radius: 6px;
-            font-size: 13px;
-            display: none;
-        }
-
-        .status-message.info {
-            background: #e3f2fd;
-            color: #1565c0;
-            border: 1px solid #90caf9;
-        }
-
-        .status-message.success {
-            background: #e8f5e9;
-            color: #2e7d32;
-            border: 1px solid #81c784;
-        }
-
-        .status-message.error {
-            background: #ffebee;
-            color: #c62828;
-            border: 1px solid #ef5350;
-        }
-
-        .spinner {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border: 2px solid currentColor;
-            border-top-color: transparent;
-            border-radius: 50%;
-            animation: spin 0.6s linear infinite;
-            margin-right: 6px;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        .footer {
-            margin-top: 30px;
-            padding-top: 20px;
-            border-top: 1px solid #eee;
-            text-align: center;
+        .field-caption {
+            color: #5b667a;
             font-size: 12px;
-            color: #999;
+            font-weight: 650;
+            margin-bottom: 5px;
+        }
+
+        .status {
+            display: none;
+            margin-top: 14px;
+            border-radius: 6px;
+            padding: 11px 12px;
+            font-size: 13px;
+            line-height: 1.4;
+        }
+
+        .status.info {
+            display: block;
+            background: #e8f1ff;
+            border: 1px solid #bed5fb;
+            color: #16427d;
+        }
+
+        .status.error {
+            display: block;
+            background: #fff0f1;
+            border: 1px solid #f0bac0;
+            color: #8c1020;
+        }
+
+        .status.success {
+            display: block;
+            background: #eaf7ef;
+            border: 1px solid #b8dec7;
+            color: #1c5d3b;
+        }
+
+        .job-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin-bottom: 12px;
+        }
+
+        .job-title h2 {
+            font-size: 16px;
+            letter-spacing: 0;
+        }
+
+        .badge {
+            border-radius: 999px;
+            background: #edf1f6;
+            color: #4b5870;
+            font-size: 12px;
+            font-weight: 700;
+            padding: 4px 9px;
+            text-transform: uppercase;
+        }
+
+        .progress-track {
+            height: 10px;
+            overflow: hidden;
+            border-radius: 999px;
+            background: #e1e7f0;
+            margin-bottom: 12px;
+        }
+
+        .progress-fill {
+            width: 0%;
+            height: 100%;
+            background: #b4172a;
+            transition: width 0.3s ease;
+        }
+
+        .job-meta {
+            color: #5b667a;
+            font-size: 13px;
+            line-height: 1.5;
+            margin-bottom: 14px;
+        }
+
+        .log-list {
+            display: grid;
+            gap: 7px;
+            max-height: 320px;
+            overflow-y: auto;
+            border-top: 1px solid #e2e7ef;
+            padding-top: 12px;
+        }
+
+        .log-item {
+            display: grid;
+            grid-template-columns: 58px 1fr;
+            gap: 8px;
+            color: #303c50;
+            font-size: 12px;
+            line-height: 1.35;
+        }
+
+        .log-time {
+            color: #7a8597;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .empty-state {
+            color: #7a8597;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+
+        @media (max-width: 860px) {
+            body {
+                padding: 16px;
+            }
+
+            .layout {
+                grid-template-columns: 1fr;
+            }
+
+            .date-grid {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>📥 Avianca Tariff Downloader</h1>
-        <p class="subtitle">Select your preferences and download merged tariff data</p>
+    <main class="shell">
+        <header>
+            <h1>Avianca TRF007 Downloader</h1>
+            <p class="subtitle">Tariff exports for selected origin airports</p>
+        </header>
 
-        <div class="form-group">
-            <label for="module">Module</label>
-            <select id="module">
-                <option value="TRF007">TRF007 - Tariff/Rate Requests</option>
-                <option value="BKG001">BKG001 - Bookings (future)</option>
-                <option value="AWB001">AWB001 - Airway Bills (future)</option>
-            </select>
-        </div>
-
-        <div class="form-group">
-            <label>Select airports</label>
-            <div class="button-group">
-                <button id="selectAllBtn">Select all (23)</button>
-                <button id="clearBtn">Clear</button>
-            </div>
-            <div class="airports-grid" id="airportsGrid"></div>
-            <div class="selected-count"><span id="selectedCount">23</span> airports selected</div>
-        </div>
-
-        <div class="form-group">
-            <label>Date range</label>
-            <div class="date-group">
-                <div>
-                    <label style="font-size: 12px; margin-bottom: 4px; color: #666;">From</label>
-                    <input type="date" id="startDate">
+        <div class="layout">
+            <section class="panel">
+                <div class="form-group">
+                    <label for="module">Module</label>
+                    <select id="module">
+                        <option value="TRF007">TRF007 - Tariff/Rate Requests</option>
+                    </select>
                 </div>
-                <div>
-                    <label style="font-size: 12px; margin-bottom: 4px; color: #666;">To</label>
-                    <input type="date" id="endDate">
+
+                <div class="form-group">
+                    <label>Airports</label>
+                    <div class="button-row">
+                        <button type="button" id="selectAllBtn">Select all</button>
+                        <button type="button" id="clearBtn">Clear</button>
+                    </div>
+                    <div class="airports-grid" id="airportsGrid"></div>
+                    <div class="selected-count"><span id="selectedCount">0</span> selected</div>
                 </div>
-            </div>
+
+                <div class="form-group">
+                    <label>Date range</label>
+                    <div class="date-grid">
+                        <div>
+                            <div class="field-caption">From</div>
+                            <input type="date" id="startDate">
+                        </div>
+                        <div>
+                            <div class="field-caption">To</div>
+                            <input type="date" id="endDate">
+                        </div>
+                    </div>
+                </div>
+
+                <button type="button" class="primary-btn" id="downloadBtn">Start download</button>
+                <div id="statusMessage" class="status"></div>
+            </section>
+
+            <aside class="panel">
+                <div class="job-title">
+                    <h2>Job Status</h2>
+                    <span class="badge" id="jobBadge">Idle</span>
+                </div>
+                <div class="progress-track" aria-hidden="true">
+                    <div class="progress-fill" id="progressFill"></div>
+                </div>
+                <div class="job-meta" id="jobMeta">No active job.</div>
+                <div id="downloadArea"></div>
+                <div class="log-list" id="logList">
+                    <div class="empty-state">Progress messages will appear here after a job starts.</div>
+                </div>
+            </aside>
         </div>
-
-        <button class="download-btn" id="downloadBtn">Download merged file</button>
-
-        <div id="statusMessage" class="status-message"></div>
-
-        <div class="footer">
-            <p>Your download will include tariff data merged from all selected airports.</p>
-        </div>
-    </div>
+    </main>
 
     <script>
         const AIRPORTS = [
@@ -261,23 +375,48 @@
             "CGO", "DPS", "GMP", "HAN", "PEK", "NRT", "MFM", "SGN",
             "PVG", "HND", "KHI", "DAD", "SZX", "KIX", "LHE"
         ];
+        const MAX_RANGE_DAYS = 15;
 
-        // Initialize dates
-        function initDates() {
-            const today = new Date();
-            const in15days = new Date(today);
-            in15days.setDate(in15days.getDate() + 15);
+        let pollTimer = null;
+        let activeJobId = null;
+        let autoDownloadStarted = false;
 
-            document.getElementById('startDate').valueAsDate = today;
-            document.getElementById('endDate').valueAsDate = in15days;
+        function addDays(date, days) {
+            const next = new Date(date);
+            next.setDate(next.getDate() + days);
+            return next;
         }
 
-        // Populate airports
+        function toInputDate(date) {
+            return date.toISOString().slice(0, 10);
+        }
+
+        function initDates() {
+            const today = new Date();
+            document.getElementById("startDate").value = toInputDate(today);
+            document.getElementById("endDate").value = toInputDate(addDays(today, MAX_RANGE_DAYS));
+            syncDateLimits();
+        }
+
+        function syncDateLimits() {
+            const startInput = document.getElementById("startDate");
+            const endInput = document.getElementById("endDate");
+            if (!startInput.value) return;
+
+            const startDate = new Date(startInput.value + "T00:00:00");
+            endInput.min = startInput.value;
+            endInput.max = toInputDate(addDays(startDate, MAX_RANGE_DAYS));
+
+            if (endInput.value < endInput.min || endInput.value > endInput.max) {
+                endInput.value = endInput.max;
+            }
+        }
+
         function initAirports() {
-            const grid = document.getElementById('airportsGrid');
-            AIRPORTS.forEach(airport => {
-                const label = document.createElement('label');
-                label.className = 'airport-label';
+            const grid = document.getElementById("airportsGrid");
+            AIRPORTS.forEach((airport) => {
+                const label = document.createElement("label");
+                label.className = "airport-label";
                 label.innerHTML = `
                     <input type="checkbox" class="airport-checkbox" value="${airport}" checked>
                     <span>${airport}</span>
@@ -285,85 +424,205 @@
                 grid.appendChild(label);
             });
 
-            document.querySelectorAll('.airport-checkbox').forEach(cb => {
-                cb.addEventListener('change', updateSelectedCount);
+            document.querySelectorAll(".airport-checkbox").forEach((checkbox) => {
+                checkbox.addEventListener("change", updateSelectedCount);
             });
+            updateSelectedCount();
         }
 
         function updateSelectedCount() {
-            const selected = document.querySelectorAll('.airport-checkbox:checked').length;
-            document.getElementById('selectedCount').textContent = selected;
+            const selected = document.querySelectorAll(".airport-checkbox:checked").length;
+            document.getElementById("selectedCount").textContent = selected;
         }
 
-        document.getElementById('selectAllBtn').addEventListener('click', () => {
-            document.querySelectorAll('.airport-checkbox').forEach(cb => cb.checked = true);
-            updateSelectedCount();
-        });
+        function selectedAirports() {
+            return Array.from(document.querySelectorAll(".airport-checkbox:checked")).map((checkbox) => checkbox.value);
+        }
 
-        document.getElementById('clearBtn').addEventListener('click', () => {
-            document.querySelectorAll('.airport-checkbox').forEach(cb => cb.checked = false);
-            updateSelectedCount();
-        });
+        function setBusy(isBusy) {
+            document.getElementById("downloadBtn").disabled = isBusy;
+            document.querySelectorAll("input, select, #selectAllBtn, #clearBtn").forEach((element) => {
+                element.disabled = isBusy;
+            });
+        }
 
-        document.getElementById('downloadBtn').addEventListener('click', async () => {
-            const module = document.getElementById('module').value;
-            const airports = Array.from(document.querySelectorAll('.airport-checkbox:checked'))
-                .map(cb => cb.value);
-            const startDate = document.getElementById('startDate').value;
-            const endDate = document.getElementById('endDate').value;
+        function showStatus(message, type) {
+            const element = document.getElementById("statusMessage");
+            element.textContent = message;
+            element.className = `status ${type}`;
+        }
+
+        function clearStatus() {
+            const element = document.getElementById("statusMessage");
+            element.textContent = "";
+            element.className = "status";
+        }
+
+        async function startDownload() {
+            const airports = selectedAirports();
+            const payload = {
+                module: document.getElementById("module").value,
+                airports,
+                startDate: document.getElementById("startDate").value,
+                endDate: document.getElementById("endDate").value
+            };
 
             if (!airports.length) {
-                showStatus('Please select at least one airport', 'error');
+                showStatus("Select at least one airport.", "error");
                 return;
             }
 
-            showStatus('⏳ Preparing download... This may take a few minutes...', 'info');
-            document.getElementById('downloadBtn').disabled = true;
+            setBusy(true);
+            clearStatus();
+            autoDownloadStarted = false;
+            renderJobSkeleton("Starting");
 
             try {
-                const response = await fetch('/api/download', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        module,
-                        airports,
-                        startDate,
-                        endDate
-                    })
+                const response = await fetch("/api/download", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "X-Client-Version": "job-api-v2"
+                    },
+                    body: JSON.stringify(payload)
                 });
+                const data = await response.json();
 
                 if (!response.ok) {
-                    const error = await response.json();
-                    throw new Error(error.error || 'Download failed');
+                    if (response.status === 409 && data.activeJob) {
+                        activeJobId = data.activeJob.id;
+                        renderJob(data.activeJob);
+                        beginPolling(activeJobId);
+                    }
+                    throw new Error(data.error || "Download could not start");
                 }
 
-                // Download file
-                const blob = await response.blob();
-                const url = window.URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `TRF007_${airports.length}airports_${startDate}_to_${endDate}.xlsx`;
-                document.body.appendChild(a);
-                a.click();
-                window.URL.revokeObjectURL(url);
-                a.remove();
-
-                showStatus('✓ Download complete!', 'success');
+                activeJobId = data.id;
+                renderJob(data);
+                beginPolling(activeJobId);
+                showStatus("Download job started.", "info");
             } catch (error) {
-                showStatus('Error: ' + error.message, 'error');
-            } finally {
-                document.getElementById('downloadBtn').disabled = false;
+                showStatus(error.message, "error");
+                if (!activeJobId) {
+                    setBusy(false);
+                    renderIdle();
+                }
             }
-        });
-
-        function showStatus(msg, type) {
-            const el = document.getElementById('statusMessage');
-            el.textContent = msg;
-            el.className = `status-message ${type}`;
-            el.style.display = 'block';
         }
 
-        // Initialize
+        function beginPolling(jobId) {
+            if (pollTimer) {
+                clearInterval(pollTimer);
+            }
+            pollTimer = setInterval(() => pollJob(jobId), 3000);
+            pollJob(jobId);
+        }
+
+        async function pollJob(jobId) {
+            try {
+                const response = await fetch(`/api/jobs/${jobId}`);
+                const job = await response.json();
+                if (!response.ok) {
+                    throw new Error(job.error || "Could not load job");
+                }
+                renderJob(job);
+
+                if (job.status === "completed") {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    setBusy(false);
+                    showStatus("Merged file is ready.", "success");
+                    if (!autoDownloadStarted && job.downloadUrl) {
+                        autoDownloadStarted = true;
+                        window.location.href = job.downloadUrl;
+                    }
+                }
+
+                if (job.status === "failed") {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    setBusy(false);
+                    showStatus(job.error || "Download failed.", "error");
+                }
+            } catch (error) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+                setBusy(false);
+                showStatus(error.message, "error");
+            }
+        }
+
+        function renderJobSkeleton(status) {
+            document.getElementById("jobBadge").textContent = status;
+            document.getElementById("progressFill").style.width = "0%";
+            document.getElementById("jobMeta").textContent = "Creating job...";
+            document.getElementById("downloadArea").innerHTML = "";
+            document.getElementById("logList").innerHTML = '<div class="empty-state">Waiting for first progress message.</div>';
+        }
+
+        function renderIdle() {
+            document.getElementById("jobBadge").textContent = "Idle";
+            document.getElementById("progressFill").style.width = "0%";
+            document.getElementById("jobMeta").textContent = "No active job.";
+            document.getElementById("downloadArea").innerHTML = "";
+            document.getElementById("logList").innerHTML = '<div class="empty-state">Progress messages will appear here after a job starts.</div>';
+        }
+
+        function renderJob(job) {
+            const progress = job.progress || 0;
+            document.getElementById("jobBadge").textContent = job.status;
+            document.getElementById("progressFill").style.width = `${progress}%`;
+            document.getElementById("jobMeta").textContent =
+                `${job.airports.length} airports | ${job.startDate} to ${job.endDate} | ${progress}%`;
+
+            if (job.status === "completed" && job.downloadUrl) {
+                document.getElementById("downloadArea").innerHTML =
+                    `<a class="download-link" href="${job.downloadUrl}">Download Excel file</a>`;
+            } else {
+                document.getElementById("downloadArea").innerHTML = "";
+            }
+
+            const logList = document.getElementById("logList");
+            if (!job.logs || !job.logs.length) {
+                logList.innerHTML = '<div class="empty-state">Waiting for first progress message.</div>';
+                return;
+            }
+
+            logList.innerHTML = job.logs.map((entry) => `
+                <div class="log-item">
+                    <span class="log-time">${entry.time}</span>
+                    <span>${escapeHtml(entry.message)}</span>
+                </div>
+            `).join("");
+            logList.scrollTop = logList.scrollHeight;
+        }
+
+        function escapeHtml(value) {
+            return String(value)
+                .replaceAll("&", "&amp;")
+                .replaceAll("<", "&lt;")
+                .replaceAll(">", "&gt;")
+                .replaceAll('"', "&quot;")
+                .replaceAll("'", "&#039;");
+        }
+
+        document.getElementById("selectAllBtn").addEventListener("click", () => {
+            document.querySelectorAll(".airport-checkbox").forEach((checkbox) => {
+                checkbox.checked = true;
+            });
+            updateSelectedCount();
+        });
+
+        document.getElementById("clearBtn").addEventListener("click", () => {
+            document.querySelectorAll(".airport-checkbox").forEach((checkbox) => {
+                checkbox.checked = false;
+            });
+            updateSelectedCount();
+        });
+
+        document.getElementById("startDate").addEventListener("change", syncDateLimits);
+        document.getElementById("downloadBtn").addEventListener("click", startDownload);
+
         initDates();
         initAirports();
     </script>
