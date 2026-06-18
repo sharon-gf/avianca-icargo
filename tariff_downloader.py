@@ -321,10 +321,15 @@ def send_notification_email(success: bool, details: str = ""):
 def init_selenium_driver():
     """Initialize Selenium WebDriver for Chrome"""
     chrome_options = webdriver.ChromeOptions()
-    chrome_options.add_argument("--start-maximized")
-    # chrome_options.add_argument("--headless")  # Uncomment for headless mode
     
-    # Configure downloads folder to Avianca_bookings
+    # Railway/headless mode
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-extensions")
+    
+    # Configure downloads folder
     download_dir = os.path.expanduser("~/Downloads/Avianca_Bookings")
     Path(download_dir).mkdir(parents=True, exist_ok=True)
     
@@ -332,11 +337,16 @@ def init_selenium_driver():
         "download.default_directory": download_dir,
         "download.prompt_for_download": False,
         "profile.default_content_settings.popups": 0,
-        "profile.managed_default_content_settings.notifications": 2  # Disable notifications
+        "profile.managed_default_content_settings.notifications": 2
     }
     chrome_options.add_experimental_option("prefs", prefs)
     
-    driver = webdriver.Chrome(options=chrome_options)
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+    except:
+        # Fallback if webdriver-manager doesn't work
+        driver = webdriver.Chrome(options=chrome_options)
+    
     driver.set_page_load_timeout(30)
     return driver
 
