@@ -140,6 +140,19 @@
             text-decoration: none;
         }
 
+        .danger-btn {
+            width: 100%;
+            min-height: 42px;
+            background: #ffffff;
+            border-color: #c74c59;
+            color: #9d1e2d;
+            margin-bottom: 12px;
+        }
+
+        .danger-btn:hover:not(:disabled) {
+            background: #fff0f1;
+        }
+
         .airports-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
@@ -361,7 +374,7 @@
                     <div class="progress-fill" id="progressFill"></div>
                 </div>
                 <div class="job-meta" id="jobMeta">No active job.</div>
-                <div id="downloadArea"></div>
+                <div id="jobActions"></div>
                 <div class="log-list" id="logList">
                     <div class="empty-state">Progress messages will appear here after a job starts.</div>
                 </div>
@@ -459,6 +472,11 @@
         }
 
         async function startDownload() {
+            if (window.location.protocol === "file:") {
+                showStatus("Open the Railway URL or local Flask URL, not the raw HTML file.", "error");
+                return;
+            }
+
             const airports = selectedAirports();
             const payload = {
                 module: document.getElementById("module").value,
@@ -510,6 +528,32 @@
             }
         }
 
+        async function abortJob() {
+            if (!activeJobId) return;
+
+            const button = document.getElementById("abortBtn");
+            if (button) {
+                button.disabled = true;
+                button.textContent = "Aborting...";
+            }
+            showStatus("Abort requested. The browser job will stop at the next safe checkpoint.", "info");
+
+            try {
+                const response = await fetch(`/api/jobs/${activeJobId}/cancel`, {
+                    method: "POST",
+                    headers: { "X-Client-Version": "job-api-v2" }
+                });
+                const job = await response.json();
+                if (!response.ok) {
+                    throw new Error(job.error || "Could not abort job");
+                }
+                renderJob(job);
+                beginPolling(activeJobId);
+            } catch (error) {
+                showStatus(error.message, "error");
+            }
+        }
+
         function beginPolling(jobId) {
             if (pollTimer) {
                 clearInterval(pollTimer);
@@ -544,6 +588,13 @@
                     setBusy(false);
                     showStatus(job.error || "Download failed.", "error");
                 }
+
+                if (job.status === "cancelled") {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    setBusy(false);
+                    showStatus("Download cancelled.", "info");
+                }
             } catch (error) {
                 clearInterval(pollTimer);
                 pollTimer = null;
@@ -556,7 +607,7 @@
             document.getElementById("jobBadge").textContent = status;
             document.getElementById("progressFill").style.width = "0%";
             document.getElementById("jobMeta").textContent = "Creating job...";
-            document.getElementById("downloadArea").innerHTML = "";
+            document.getElementById("jobActions").innerHTML = "";
             document.getElementById("logList").innerHTML = '<div class="empty-state">Waiting for first progress message.</div>';
         }
 
@@ -564,7 +615,7 @@
             document.getElementById("jobBadge").textContent = "Idle";
             document.getElementById("progressFill").style.width = "0%";
             document.getElementById("jobMeta").textContent = "No active job.";
-            document.getElementById("downloadArea").innerHTML = "";
+            document.getElementById("jobActions").innerHTML = "";
             document.getElementById("logList").innerHTML = '<div class="empty-state">Progress messages will appear here after a job starts.</div>';
         }
 
@@ -576,10 +627,19 @@
                 `${job.airports.length} airports | ${job.startDate} to ${job.endDate} | ${progress}%`;
 
             if (job.status === "completed" && job.downloadUrl) {
-                document.getElementById("downloadArea").innerHTML =
+                document.getElementById("jobActions").innerHTML =
                     `<a class="download-link" href="${job.downloadUrl}">Download Excel file</a>`;
+            } else if (["queued", "running", "cancelling"].includes(job.status)) {
+                const disabled = job.status === "cancelling" ? "disabled" : "";
+                const label = job.status === "cancelling" ? "Aborting..." : "Abort job";
+                document.getElementById("jobActions").innerHTML =
+                    `<button type="button" class="danger-btn" id="abortBtn" ${disabled}>${label}</button>`;
+                const abortButton = document.getElementById("abortBtn");
+                if (abortButton) {
+                    abortButton.addEventListener("click", abortJob);
+                }
             } else {
-                document.getElementById("downloadArea").innerHTML = "";
+                document.getElementById("jobActions").innerHTML = "";
             }
 
             const logList = document.getElementById("logList");
@@ -625,6 +685,10 @@
 
         initDates();
         initAirports();
+        if (window.location.protocol === "file:") {
+            showStatus("This is the raw HTML file. Open the Railway URL to run downloads.", "error");
+            document.getElementById("downloadBtn").disabled = true;
+        }
     </script>
 </body>
 </html>
