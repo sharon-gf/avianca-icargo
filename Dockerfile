@@ -48,7 +48,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app
+# Copy ALL app files
 COPY app.py .
 COPY tariff_downloader.py .
 COPY templates/ templates/
