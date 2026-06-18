@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Avianca Tariff Downloader</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', sans-serif;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.1);
+            padding: 40px;
+        }
+
+        h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+            color: #1a1a1a;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+
+        .form-group {
+            margin-bottom: 24px;
+        }
+
+        label {
+            display: block;
+            font-weight: 500;
+            margin-bottom: 8px;
+            color: #1a1a1a;
+            font-size: 14px;
+        }
+
+        select, input[type="date"] {
+            width: 100%;
+            padding: 10px 12px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            font-family: inherit;
+        }
+
+        select:focus, input[type="date"]:focus {
+            outline: none;
+            border-color: #0066cc;
+            box-shadow: 0 0 0 3px rgba(0, 102, 204, 0.1);
+        }
+
+        .button-group {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+
+        .button-group button {
+            flex: 1;
+            padding: 8px 12px;
+            background: #f0f0f0;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .button-group button:hover {
+            background: #e8e8e8;
+            border-color: #ccc;
+        }
+
+        .airports-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(60px, 1fr));
+            gap: 8px;
+            padding: 12px;
+            background: #f9f9f9;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .airport-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            user-select: none;
+        }
+
+        .airport-label input[type="checkbox"] {
+            cursor: pointer;
+            width: 14px;
+            height: 14px;
+        }
+
+        .selected-count {
+            font-size: 12px;
+            color: #666;
+            margin-top: 8px;
+        }
+
+        .date-group {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .download-btn {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #0066cc 0%, #004499 100%);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-top: 10px;
+        }
+
+        .download-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 102, 204, 0.3);
+        }
+
+        .download-btn:active {
+            transform: translateY(0);
+        }
+
+        .download-btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .status-message {
+            margin-top: 16px;
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            display: none;
+        }
+
+        .status-message.info {
+            background: #e3f2fd;
+            color: #1565c0;
+            border: 1px solid #90caf9;
+        }
+
+        .status-message.success {
+            background: #e8f5e9;
+            color: #2e7d32;
+            border: 1px solid #81c784;
+        }
+
+        .status-message.error {
+            background: #ffebee;
+            color: #c62828;
+            border: 1px solid #ef5350;
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid currentColor;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            margin-right: 6px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .footer {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #eee;
+            text-align: center;
+            font-size: 12px;
+            color: #999;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📥 Avianca Tariff Downloader</h1>
+        <p class="subtitle">Select your preferences and download merged tariff data</p>
+
+        <div class="form-group">
+            <label for="module">Module</label>
+            <select id="module">
+                <option value="TRF007">TRF007 - Tariff/Rate Requests</option>
+                <option value="BKG001">BKG001 - Bookings (future)</option>
+                <option value="AWB001">AWB001 - Airway Bills (future)</option>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <label>Select airports</label>
+            <div class="button-group">
+                <button id="selectAllBtn">Select all (27)</button>
+                <button id="clearBtn">Clear</button>
+            </div>
+            <div class="airports-grid" id="airportsGrid"></div>
+            <div class="selected-count"><span id="selectedCount">27</span> airports selected</div>
+        </div>
+
+        <div class="form-group">
+            <label>Date range</label>
+            <div class="date-group">
+                <div>
+                    <label style="font-size: 12px; margin-bottom: 4px; color: #666;">From</label>
+                    <input type="date" id="startDate">
+                </div>
+                <div>
+                    <label style="font-size: 12px; margin-bottom: 4px; color: #666;">To</label>
+                    <input type="date" id="endDate">
+                </div>
+            </div>
+        </div>
+
+        <button class="download-btn" id="downloadBtn">Download merged file</button>
+
+        <div id="statusMessage" class="status-message"></div>
+
+        <div class="footer">
+            <p>Your download will include tariff data merged from all selected airports.</p>
+        </div>
+    </div>
+
+    <script>
+        const AIRPORTS = [
+            "CAN", "HKG", "NGO", "ISB", "XMN", "CGK", "ICN", "TPE",
+            "CGO", "DPS", "GMP", "HAN", "PEK", "NRT", "MFM", "SGN",
+            "PVG", "HND", "KHI", "DAD", "SZX", "KIX", "LHE"
+        ];
+
+        // Initialize dates
+        function initDates() {
+            const today = new Date();
+            const in15days = new Date(today);
+            in15days.setDate(in15days.getDate() + 15);
+
+            document.getElementById('startDate').valueAsDate = today;
+            document.getElementById('endDate').valueAsDate = in15days;
+        }
+
+        // Populate airports
+        function initAirports() {
+            const grid = document.getElementById('airportsGrid');
+            AIRPORTS.forEach(airport => {
+                const label = document.createElement('label');
+                label.className = 'airport-label';
+                label.innerHTML = `
+                    <input type="checkbox" class="airport-checkbox" value="${airport}" checked>
+                    <span>${airport}</span>
+                `;
+                grid.appendChild(label);
+            });
+
+            document.querySelectorAll('.airport-checkbox').forEach(cb => {
+                cb.addEventListener('change', updateSelectedCount);
+            });
+        }
+
+        function updateSelectedCount() {
+            const selected = document.querySelectorAll('.airport-checkbox:checked').length;
+            document.getElementById('selectedCount').textContent = selected;
+        }
+
+        document.getElementById('selectAllBtn').addEventListener('click', () => {
+            document.querySelectorAll('.airport-checkbox').forEach(cb => cb.checked = true);
+            updateSelectedCount();
+        });
+
+        document.getElementById('clearBtn').addEventListener('click', () => {
+            document.querySelectorAll('.airport-checkbox').forEach(cb => cb.checked = false);
+            updateSelectedCount();
+        });
+
+        document.getElementById('downloadBtn').addEventListener('click', async () => {
+            const module = document.getElementById('module').value;
+            const airports = Array.from(document.querySelectorAll('.airport-checkbox:checked'))
+                .map(cb => cb.value);
+            const startDate = document.getElementById('startDate').value;
+            const endDate = document.getElementById('endDate').value;
+
+            if (!airports.length) {
+                showStatus('Please select at least one airport', 'error');
+                return;
+            }
+
+            showStatus('Preparing your download...', 'info');
+            document.getElementById('downloadBtn').disabled = true;
+
+            try {
+                const response = await fetch('/api/download', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        module,
+                        airports,
+                        startDate,
+                        endDate
+                    })
+                });
+
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.error || 'Download failed');
+                }
+
+                // Download file
+                const blob = await response.blob();
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `TRF007_${airports.length}airports_${startDate}_to_${endDate}.xlsx`;
+                document.body.appendChild(a);
+                a.click();
+                window.URL.revokeObjectURL(url);
+                a.remove();
+
+                showStatus('✓ Download complete!', 'success');
+            } catch (error) {
+                showStatus('Error: ' + error.message, 'error');
+            } finally {
+                document.getElementById('downloadBtn').disabled = false;
+            }
+        });
+
+        function showStatus(msg, type) {
+            const el = document.getElementById('statusMessage');
+            el.textContent = msg;
+            el.className = `status-message ${type}`;
+            el.style.display = 'block';
+        }
+
+        // Initialize
+        initDates();
+        initAirports();
+    </script>
+</body>
+</html>
