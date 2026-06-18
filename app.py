@@ -1,48 +1,23 @@
 #!/usr/bin/env python3
 """
-Avianca iCargo TRF007 downloader.
-
-This module is designed to be called by the Flask web app, but it still has a
-small CLI for local/manual runs.
+Avianca iCargo Tariff Downloader - Flask Web App.
 """
 
 from __future__ import annotations
 
-import argparse
-import email
-import imaplib
-import json
 import logging
 import os
-import re
+import importlib
 import shutil
-import smtplib
-import sys
 import tempfile
-import time
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import threading
+import uuid
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Iterable
 
-import pandas as pd
-from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-
-try:
-    import dropbox
-
-    DROPBOX_AVAILABLE = True
-except ImportError:
-    DROPBOX_AVAILABLE = False
-
+from flask import Flask, jsonify, render_template, request, send_file
 
 DEFAULT_AIRPORTS = [
     "CAN",
@@ -69,895 +44,442 @@ DEFAULT_AIRPORTS = [
     "KIX",
     "LHE",
 ]
-
 MAX_RANGE_DAYS = 15
-LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
-VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v2-downloader"
 
-ProgressCallback = Callable[[str, int | None], None]
-CancelCallback = Callable[[], bool]
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-class WorkflowCancelled(Exception):
-    """Raised when a web user cancels a running download job."""
+app = Flask(__name__)
 
-logger = logging.getLogger("avianca_downloader")
-if not logger.handlers:
-    stream_handler = logging.StreamHandler(sys.stdout)
-    stream_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logger.addHandler(stream_handler)
-logger.setLevel(logging.INFO)
-logger.propagate = False
+TEMP_DIR = Path(os.getenv("JOB_ROOT", tempfile.gettempdir())) / "avianca_downloads"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+JOB_TTL_HOURS = int(os.getenv("JOB_TTL_HOURS", "6"))
+JOB_LOCK = threading.Lock()
+JOBS: dict[str, dict] = {}
 
-@dataclass
-class DownloaderConfig:
-    avianca_email: str | None
-    gmail_email: str | None
-    gmail_app_password: str | None
-    verification_code_sender: str
-    dropbox_access_token: str | None
-    dropbox_upload_path: str
-    download_dir: Path
-    log_dir: Path
-    headless: bool
+# Use one worker because the same iCargo/Gmail login should not run multiple MFA
+# sessions at once.
+EXECUTOR = ThreadPoolExecutor(max_workers=1)
+CLIENT_VERSION = "job-api-v2"
+APP_BUILD_VERSION = "job-api-v2-app"
 
-    @classmethod
-    def from_env(cls, download_dir: str | Path | None = None) -> "DownloaderConfig":
-        avianca_email = os.getenv("AVIANCA_EMAIL")
-        gmail_email = os.getenv("GMAIL_EMAIL") or avianca_email
-        gmail_app_password = os.getenv("GMAIL_APP_PASSWORD") or os.getenv("GMAIL_PASSWORD")
-        default_download_dir = Path(tempfile.gettempdir()) / "avianca_downloads" / "manual"
-        default_log_dir = Path(tempfile.gettempdir()) / "avianca_logs"
 
-        return cls(
-            avianca_email=avianca_email,
-            gmail_email=gmail_email,
-            gmail_app_password=gmail_app_password,
-            verification_code_sender=os.getenv("VERIFICATION_CODE_SENDER", VERIFICATION_CODE_SENDER),
-            dropbox_access_token=os.getenv("DROPBOX_TOKEN") or os.getenv("DROPBOX_ACCESS_TOKEN"),
-            dropbox_upload_path=os.getenv("DROPBOX_UPLOAD_PATH", "/Cargo_Bookings"),
-            download_dir=Path(download_dir or os.getenv("DOWNLOAD_DIR", str(default_download_dir))).expanduser(),
-            log_dir=Path(os.getenv("LOG_DIR", str(default_log_dir))).expanduser(),
-            headless=os.getenv("HEADLESS", "true").lower() not in {"0", "false", "no"},
-        )
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    def validate(self) -> None:
-        missing = []
-        if not self.avianca_email:
-            missing.append("AVIANCA_EMAIL")
-        if not self.gmail_email:
-            missing.append("GMAIL_EMAIL or AVIANCA_EMAIL")
-        if not self.gmail_app_password:
-            missing.append("GMAIL_APP_PASSWORD")
-        if missing:
-            raise RuntimeError("Missing required environment variables: " + ", ".join(missing))
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
 
-def emit(callback: ProgressCallback | None, message: str, progress: int | None = None) -> None:
-    logger.info(message)
-    if callback:
-        callback(message, progress)
 
-
-def check_cancelled(cancel_callback: CancelCallback | None) -> None:
-    if cancel_callback and cancel_callback():
-        raise WorkflowCancelled("Download cancelled by user")
-
-
-def add_file_logger(log_dir: Path) -> logging.Handler:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / f"avianca_downloader_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    handler = logging.FileHandler(log_file)
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-    logger.addHandler(handler)
-    return handler
-
-
-def normalize_airports(airports: Iterable[str] | None) -> list[str]:
-    if not airports:
-        return list(DEFAULT_AIRPORTS)
-
-    normalized = []
-    for airport in airports:
-        code = airport.strip().upper()
-        if not re.fullmatch(r"[A-Z0-9]{3}", code):
-            raise ValueError(f"Invalid airport code: {airport}")
-        normalized.append(code)
-
-    if not normalized:
-        raise ValueError("At least one airport is required")
-    return normalized
-
-
-def parse_iso_date(value: str | date) -> date:
-    if isinstance(value, date):
-        return value
-    return datetime.strptime(value, "%Y-%m-%d").date()
-
-
-def format_icargo_date(value: str | date) -> str:
-    if isinstance(value, date):
-        parsed = value
-    else:
-        try:
-            parsed = datetime.strptime(value, "%Y-%m-%d").date()
-        except ValueError:
-            parsed = datetime.strptime(value.upper(), "%d-%b-%Y").date()
-    return parsed.strftime("%d-%b-%Y").upper()
-
-
-def validate_date_range(start_date: str | date | None, end_date: str | date | None) -> tuple[str, str]:
-    start = parse_iso_date(start_date or date.today())
-    end = parse_iso_date(end_date or (start + timedelta(days=MAX_RANGE_DAYS)))
-
-    days = (end - start).days
-    if days < 0:
-        raise ValueError("End date must be on or after start date")
-    if days > MAX_RANGE_DAYS:
-        raise ValueError(f"Date range cannot exceed {MAX_RANGE_DAYS} days")
-
-    return format_icargo_date(start), format_icargo_date(end)
-
-
-def find_chrome_binary() -> str | None:
-    configured = os.getenv("CHROME_BIN") or os.getenv("GOOGLE_CHROME_BIN")
-    candidates = [
-        configured,
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
-        shutil.which("google-chrome"),
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/google-chrome",
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return candidate
-    return None
-
-
-def init_selenium_driver(config: DownloaderConfig) -> webdriver.Chrome:
-    config.download_dir.mkdir(parents=True, exist_ok=True)
-
-    chrome_options = webdriver.ChromeOptions()
-    if config.headless:
-        chrome_options.add_argument("--headless=new")
-    chrome_options.add_argument("--window-size=1920,1080")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--disable-notifications")
-
-    chrome_binary = find_chrome_binary()
-    if chrome_binary:
-        chrome_options.binary_location = chrome_binary
-        logger.info("Using Chrome binary: %s", chrome_binary)
-    else:
-        logger.warning("No Chrome binary found on PATH; Selenium will try its defaults")
-
-    prefs = {
-        "download.default_directory": str(config.download_dir),
-        "download.prompt_for_download": False,
-        "profile.default_content_settings.popups": 0,
-        "profile.managed_default_content_settings.notifications": 2,
-        "safebrowsing.enabled": True,
-    }
-    chrome_options.add_experimental_option("prefs", prefs)
-
-    driver_path = os.getenv("CHROMEDRIVER_PATH") or shutil.which("chromedriver")
-    if driver_path:
-        logger.info("Using ChromeDriver: %s", driver_path)
-    elif any(name.startswith("RAILWAY_") for name in os.environ):
-        raise RuntimeError(
-            "chromedriver was not found on Railway's PATH. "
-            "Redeploy with the updated nixpacks.toml so Railway installs system chromedriver."
-        )
-
-    service = Service(driver_path) if driver_path else None
-
-    logger.info("Initializing Chrome WebDriver")
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    driver.set_page_load_timeout(45)
-
-    try:
-        driver.execute_cdp_cmd(
-            "Page.setDownloadBehavior",
-            {"behavior": "allow", "downloadPath": str(config.download_dir)},
-        )
-    except Exception as exc:
-        logger.warning("Could not set Chrome download behavior via CDP: %s", exc)
-
-    return driver
-
-
-def get_verification_code_from_email(
-    config: DownloaderConfig,
-    timeout_seconds: int = 300,
-    cancel_callback: CancelCallback | None = None,
-) -> str:
-    logger.info("Waiting for verification code email")
-    mail = None
-
-    try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(config.gmail_email, config.gmail_app_password)
-        mail.select("INBOX")
-
-        start_time = time.time()
-        time_windows = [30, 60, 120, 240]
-        current_window_idx = 0
-        last_search_window_change = start_time
-
-        while time.time() - start_time < timeout_seconds:
-            check_cancelled(cancel_callback)
-            minutes_ago = time_windows[min(current_window_idx, len(time_windows) - 1)]
-            since_date = datetime.now() - timedelta(minutes=minutes_ago)
-            since_str = since_date.strftime("%d-%b-%Y")
-
-            status, messages = mail.search(
-                None,
-                "UNSEEN",
-                "FROM",
-                config.verification_code_sender,
-                "SINCE",
-                since_str,
-            )
-
-            if status == "OK" and messages and messages[0]:
-                email_ids = messages[0].split()
-                for email_id in reversed(email_ids[-50:]):
-                    status, msg_data = mail.fetch(email_id, "(RFC822)")
-                    if status != "OK" or not msg_data:
-                        continue
-
-                    msg = email.message_from_bytes(msg_data[0][1])
-                    if not email_is_recent_and_relevant(msg, config.avianca_email):
-                        continue
-
-                    body = extract_email_body(msg)
-                    code = extract_verification_code(body)
-                    if code:
-                        try:
-                            mail.store(email_id, "+FLAGS", "\\Seen")
-                        except Exception:
-                            pass
-                        mail.close()
-                        mail.logout()
-                        logger.info("Verification code found")
-                        return code
-
-            elapsed = time.time() - start_time
-            if elapsed - last_search_window_change > 30 and current_window_idx < len(time_windows) - 1:
-                current_window_idx += 1
-                last_search_window_change = elapsed
-
-            logger.info("No verification code yet (%ss / %ss)", int(elapsed), timeout_seconds)
-            time.sleep(5)
-
-        raise TimeoutException("Verification code email not received")
-
-    except imaplib.IMAP4.abort:
-        raise
-    finally:
-        if mail:
-            try:
-                mail.close()
-            except Exception:
-                pass
-            try:
-                mail.logout()
-            except Exception:
-                pass
-
-
-def email_is_recent_and_relevant(msg: email.message.Message, avianca_email: str | None) -> bool:
-    try:
-        email_date = email.utils.parsedate_to_datetime(msg["Date"])
-        now = datetime.now(email_date.tzinfo) if email_date.tzinfo else datetime.now()
-        if (now - email_date).total_seconds() > 300:
-            return False
-    except Exception:
-        return False
-
-    email_to = msg.get("To", "")
-    return bool(avianca_email and avianca_email.lower() in email_to.lower())
-
-
-def extract_email_body(msg: email.message.Message) -> str:
-    if msg.is_multipart():
-        parts = []
-        for part in msg.walk():
-            content_type = part.get_content_type()
-            if content_type not in {"text/plain", "text/html"}:
-                continue
-            try:
-                parts.append(part.get_payload(decode=True).decode("utf-8", errors="ignore"))
-            except Exception:
-                continue
-        return "\n".join(parts)
-
-    payload = msg.get_payload(decode=True)
-    if isinstance(payload, bytes):
-        return payload.decode("utf-8", errors="ignore")
-    return str(msg.get_payload())
-
-
-def extract_verification_code(body: str) -> str | None:
-    patterns = [
-        r"\b(\d{8})\b",
-        r"(\d{4}[-\s]?\d{4})",
-        r"code[:\s]+(\d{4,8})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, body, re.IGNORECASE)
-        if match:
-            code = re.sub(r"\D", "", match.group(1))
-            if len(code) >= 8:
-                return code[:8]
-    return None
-
-
-def send_notification_email(config: DownloaderConfig, success: bool, details: str = "") -> None:
-    if not config.gmail_email or not config.gmail_app_password:
-        logger.warning("Skipping notification email because Gmail credentials are missing")
-        return
-
-    msg = MIMEMultipart()
-    msg["From"] = config.gmail_email
-    msg["To"] = config.gmail_email
-    msg["Subject"] = (
-        f"[Avianca Downloader] {'SUCCESS' if success else 'FAILED'} - "
-        f"{datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    )
-    msg.attach(MIMEText(details, "plain"))
-
-    server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
-    server.login(config.gmail_email, config.gmail_app_password)
-    server.send_message(msg)
-    server.quit()
-
-
-def login_to_avianca(
-    driver: webdriver.Chrome,
-    config: DownloaderConfig,
-    cancel_callback: CancelCallback | None = None,
-) -> bool:
-    try:
-        check_cancelled(cancel_callback)
-        logger.info("Navigating to Avianca iCargo login page")
-        driver.get(LOGIN_URL)
-        wait = WebDriverWait(driver, 20)
-
-        try:
-            email_field = wait.until(EC.presence_of_element_located((By.ID, "cred_userid_inputtext")))
-        except TimeoutException:
-            email_field = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='email']")))
-        email_field.clear()
-        email_field.send_keys(config.avianca_email)
-
-        try:
-            next_button = wait.until(EC.element_to_be_clickable((By.ID, "idSIButton9")))
-        except TimeoutException:
-            next_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Next')]")))
-        next_button.click()
-
-        time.sleep(3)
-        code = None
-        for attempt in range(1, 4):
-            check_cancelled(cancel_callback)
-            try:
-                logger.info("Waiting for verification code attempt %s/3", attempt)
-                code = get_verification_code_from_email(
-                    config,
-                    timeout_seconds=300,
-                    cancel_callback=cancel_callback,
-                )
-                break
-            except TimeoutException:
-                if attempt == 3:
-                    raise
-                time.sleep(5)
-
-        if not code:
-            raise RuntimeError("Could not retrieve verification code")
-
-        try:
-            code_field = wait.until(EC.presence_of_element_located((By.ID, "idTxtBx_OTC_Password")))
-        except TimeoutException:
-            code_field = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Code']")))
-        code_field.send_keys(code)
-
-        signin_button = wait.until(EC.element_to_be_clickable((By.ID, "idSIButton9")))
-        signin_button.click()
-
-        try:
-            stay_signed_in_no = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.ID, "idBtn_Back")))
-            stay_signed_in_no.click()
-        except TimeoutException:
-            pass
-
-        time.sleep(6)
-        if "showMainPage" not in driver.current_url and "icargo" not in driver.current_url:
-            logger.error("Login may have failed. Current URL: %s", driver.current_url)
-            return False
-
-        all_windows = driver.window_handles
-        if len(all_windows) > 1:
-            driver.switch_to.window(all_windows[-1])
-            time.sleep(2)
-
-        return True
-    except Exception:
-        logger.exception("Login failed")
-        return False
-
-
-def switch_to_comm_role(driver: webdriver.Chrome) -> bool:
-    try:
-        wait = WebDriverWait(driver, 30)
-        time.sleep(3)
-
-        more_menu = wait.until(EC.presence_of_element_located((By.XPATH, "//span[contains(@class, 'ic-toggle-menu')]")))
-        driver.execute_script("arguments[0].click();", more_menu)
-        time.sleep(2)
-
-        switch_role = wait.until(
-            EC.presence_of_element_located((By.XPATH, "//span[contains(@class, 'ic-switch-role')]//a"))
-        )
-        driver.execute_script("arguments[0].click();", switch_role)
-        time.sleep(4)
-
-        iframe = wait.until(EC.presence_of_element_located((By.ID, "swichRoleiframe")))
-        driver.switch_to.frame(iframe)
-
-        result = driver.execute_script(
-            """
-            const select = document.querySelector('[name="selectedStationRoleGroup"]') ||
-                document.querySelector('#CMB_ADMIN_USER_SWITCHROLES_LISTROLES');
-            if (!select) return 'ERROR';
-            select.value = 'COMM_ARL_N';
-            select.dispatchEvent(new Event('change', { bubbles: true }));
-            return 'SUCCESS';
-            """
-        )
-        if result != "SUCCESS":
-            driver.switch_to.default_content()
-            return False
-
-        time.sleep(2)
-        click_result = driver.execute_script(
-            """
-            const okButton = document.querySelector('#CMB_ADMIN_USER_SWITCHROLES_OK_BUTTON') ||
-                document.querySelector('button[name="btnOK"]') ||
-                document.querySelector('button[type="button"]');
-            if (!okButton) return 'ERROR';
-            okButton.click();
-            return 'OK';
-            """
-        )
-        if click_result != "OK":
-            driver.execute_script("document.body.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}))")
-
-        driver.switch_to.default_content()
-        time.sleep(5)
-        return True
-    except Exception:
-        logger.exception("Role switch failed")
-        try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
-        return False
-
-
-def navigate_to_screen(driver: webdriver.Chrome, screen_num: str = "TRF007") -> bool:
-    try:
-        wait = WebDriverWait(driver, 15)
-        screen_field = wait.until(EC.presence_of_element_located((By.ID, "ic-screen-search")))
-        screen_field.clear()
-        screen_field.send_keys(screen_num)
-        time.sleep(1)
-        screen_field.send_keys(Keys.RETURN)
-        time.sleep(5)
-        return True
-    except Exception:
-        logger.exception("Could not navigate to screen %s", screen_num)
-        return False
-
-
-def set_date_range_and_airport(
-    driver: webdriver.Chrome,
-    origin: str,
-    is_first_airport: bool,
-    start_date: str,
-    end_date: str,
-) -> bool:
-    try:
-        wait = WebDriverWait(driver, 8)
-        iframe = wait.until(EC.presence_of_element_located((By.NAME, "iCargoContentFrameTRF007")))
-        driver.switch_to.frame(iframe)
-
-        if is_first_airport:
-            driver.execute_script(
-                """
-                const fromDate = arguments[0];
-                const toDate = arguments[1];
-                const fromField = document.querySelector('#fromdate');
-                if (fromField) {
-                    fromField.value = fromDate;
-                    fromField.dispatchEvent(new Event('change', { bubbles: true }));
-                    fromField.dispatchEvent(new Event('blur', { bubbles: true }));
-                }
-                const toField = document.querySelector('#todate');
-                if (toField) {
-                    toField.value = toDate;
-                    toField.dispatchEvent(new Event('change', { bubbles: true }));
-                    toField.dispatchEvent(new Event('blur', { bubbles: true }));
-                }
-                """,
-                start_date,
-                end_date,
-            )
-            time.sleep(2)
-
-        origin_field = wait.until(
-            EC.presence_of_element_located((By.ID, "CMP_Tariff_Freight_ListSpotRateRequests_Origin"))
-        )
-        driver.execute_script(
-            """
-            const field = arguments[0];
-            const origin = arguments[1];
-            field.value = '';
-            field.dispatchEvent(new Event('change', { bubbles: true }));
-            field.value = origin;
-            field.dispatchEvent(new Event('change', { bubbles: true }));
-            field.dispatchEvent(new Event('blur', { bubbles: true }));
-            """,
-            origin_field,
-            origin,
-        )
-        time.sleep(1)
-        driver.switch_to.default_content()
-        return True
-    except Exception:
-        logger.exception("Could not set parameters for %s", origin)
-        try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
-        return False
-
-
-def execute_tariff_query(driver: webdriver.Chrome) -> bool:
-    try:
-        wait = WebDriverWait(driver, 8)
-        iframe = wait.until(EC.presence_of_element_located((By.NAME, "iCargoContentFrameTRF007")))
-        driver.switch_to.frame(iframe)
-
-        list_button = wait.until(
-            EC.element_to_be_clickable((By.ID, "CMP_Tariff_Freight_ListSpotRateRequests_List"))
-        )
-        driver.execute_script("arguments[0].scrollIntoView(true);", list_button)
-        time.sleep(0.5)
-        list_button.click()
-        time.sleep(5)
-
-        driver.switch_to.default_content()
-        return True
-    except Exception:
-        logger.exception("Could not execute tariff query")
-        try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
-        return False
-
-
-def download_results_as_excel(
-    driver: webdriver.Chrome,
-    download_dir: Path,
-    cancel_callback: CancelCallback | None = None,
-) -> Path | None:
-    try:
-        wait = WebDriverWait(driver, 8)
-        existing_names = {path.name for path in download_dir.glob("*.xlsx")}
-        click_time = time.time()
-
-        iframe = wait.until(EC.presence_of_element_located((By.NAME, "iCargoContentFrameTRF007")))
-        driver.switch_to.frame(iframe)
-
-        try:
-            export_link = wait.until(EC.element_to_be_clickable((By.ID, "exportToExcelLink")))
-        except TimeoutException:
-            export_link = driver.find_element(By.XPATH, "//a[contains(text(), 'Excel')]")
-
-        driver.execute_script("arguments[0].scrollIntoView(true);", export_link)
-        time.sleep(0.5)
-        export_link.click()
-        driver.switch_to.default_content()
-
-        return wait_for_new_download(
-            download_dir,
-            existing_names,
-            click_time,
-            cancel_callback=cancel_callback,
-        )
-    except Exception:
-        logger.exception("Could not export results to Excel")
-        try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
-        return None
-
-
-def wait_for_new_download(
-    download_dir: Path,
-    existing_names: set[str],
-    start_time: float,
-    timeout: int = 90,
-    cancel_callback: CancelCallback | None = None,
-) -> Path | None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        check_cancelled(cancel_callback)
-        partials = list(download_dir.glob("*.crdownload")) + list(download_dir.glob("*.tmp"))
-        if partials:
-            time.sleep(1)
-            continue
-
-        candidates = []
-        for path in download_dir.glob("*.xlsx"):
-            try:
-                is_new_name = path.name not in existing_names
-                is_recent = path.stat().st_mtime >= start_time
-                if is_new_name or is_recent:
-                    candidates.append(path)
-            except FileNotFoundError:
-                continue
-
-        if candidates:
-            return max(candidates, key=lambda item: item.stat().st_mtime)
-
-        time.sleep(1)
-
-    return None
-
-
-def merge_excel_files(file_directory: str | Path, output_filename: str = "merged_tariffs.xlsx") -> Path | None:
-    target_dir = Path(file_directory)
-    output_path = target_dir / output_filename
-
-    excel_files = sorted(
-        path
-        for path in target_dir.glob("*.xlsx")
-        if path.name != output_filename and not path.name.startswith("~$")
-    )
-    if not excel_files:
-        logger.error("No Excel files found to merge in %s", target_dir)
-        return None
-
-    dataframes = []
-    for excel_file in excel_files:
-        try:
-            df = pd.read_excel(excel_file)
-            dataframes.append(df)
-            logger.info("Loaded %s (%s rows)", excel_file.name, len(df))
-        except Exception as exc:
-            logger.warning("Could not read %s: %s", excel_file.name, exc)
-
-    if not dataframes:
-        logger.error("No readable Excel files found in %s", target_dir)
-        return None
-
-    merged_df = pd.concat(dataframes, ignore_index=True).dropna(how="all")
-    merged_df.to_excel(output_path, index=False, sheet_name="Data")
-    logger.info("Merged file saved to %s", output_path)
-
-    for excel_file in excel_files:
-        try:
-            excel_file.unlink()
-        except Exception as exc:
-            logger.warning("Could not delete %s: %s", excel_file.name, exc)
-
-    return output_path
-
-
-def upload_to_dropbox(config: DownloaderConfig, file_path: str | Path) -> bool:
-    if not DROPBOX_AVAILABLE:
-        logger.warning("Dropbox SDK is not installed; skipping upload")
-        return True
-    if not config.dropbox_access_token:
-        logger.info("DROPBOX_TOKEN is not configured; skipping upload")
-        return True
-
-    try:
-        file_path = Path(file_path)
-        dbx = dropbox.Dropbox(config.dropbox_access_token)
-        dbx.users_get_current_account()
-        destination = f"{config.dropbox_upload_path}/{file_path.name}"
-        with file_path.open("rb") as handle:
-            dbx.files_upload(handle.read(), destination, autorename=True)
-        logger.info("Uploaded merged file to Dropbox: %s", destination)
-        return True
-    except Exception:
-        logger.exception("Dropbox upload failed")
-        return False
-
-
-def run_download_workflow(
-    airports: Iterable[str] | None = None,
-    start_date: str | date | None = None,
-    end_date: str | date | None = None,
-    download_dir: str | Path | None = None,
-    upload_dropbox: bool = False,
-    send_email: bool = False,
-    progress_callback: ProgressCallback | None = None,
-    cancel_callback: CancelCallback | None = None,
-) -> dict:
-    config = DownloaderConfig.from_env(download_dir=download_dir)
-    config.validate()
-
-    selected_airports = normalize_airports(airports)
-    icargo_start_date, icargo_end_date = validate_date_range(start_date, end_date)
-    config.download_dir.mkdir(parents=True, exist_ok=True)
-
-    file_handler = add_file_logger(config.log_dir)
-    driver = None
-    successful_downloads = 0
-    failed_downloads = 0
-
-    try:
-        check_cancelled(cancel_callback)
-        emit(progress_callback, "Starting Avianca TRF007 download", 3)
-        emit(progress_callback, f"Airports selected: {', '.join(selected_airports)}", 5)
-        emit(progress_callback, f"Date range: {icargo_start_date} to {icargo_end_date}", 6)
-
-        driver = init_selenium_driver(config)
-        emit(progress_callback, "Chrome started", 8)
-
-        check_cancelled(cancel_callback)
-        if not login_to_avianca(driver, config, cancel_callback=cancel_callback):
-            raise RuntimeError("Failed to login to Avianca iCargo")
-        emit(progress_callback, "Logged in to iCargo", 18)
-
-        check_cancelled(cancel_callback)
-        if not switch_to_comm_role(driver):
-            raise RuntimeError("Failed to switch to COMM role")
-        emit(progress_callback, "Switched to COMM role", 23)
-
-        check_cancelled(cancel_callback)
-        if not navigate_to_screen(driver, "TRF007"):
-            raise RuntimeError("Failed to navigate to TRF007")
-        emit(progress_callback, "Opened TRF007", 28)
-
-        total_airports = len(selected_airports)
-        for index, airport in enumerate(selected_airports, start=1):
-            check_cancelled(cancel_callback)
-            base_progress = 30 + int(((index - 1) / total_airports) * 50)
-            emit(progress_callback, f"Processing {airport} ({index}/{total_airports})", base_progress)
-
-            if not set_date_range_and_airport(
-                driver,
-                airport,
-                is_first_airport=index == 1,
-                start_date=icargo_start_date,
-                end_date=icargo_end_date,
-            ):
-                failed_downloads += 1
-                emit(progress_callback, f"{airport}: failed to set query parameters", base_progress)
-                continue
-
-            if not execute_tariff_query(driver):
-                failed_downloads += 1
-                emit(progress_callback, f"{airport}: query failed", base_progress)
-                continue
-
-            check_cancelled(cancel_callback)
-            downloaded_file = download_results_as_excel(
-                driver,
-                config.download_dir,
-                cancel_callback=cancel_callback,
-            )
-            if not downloaded_file:
-                failed_downloads += 1
-                emit(progress_callback, f"{airport}: export failed or timed out", base_progress)
-                continue
-
-            successful_downloads += 1
-            emit(progress_callback, f"{airport}: downloaded {downloaded_file.name}", base_progress + 2)
-            for _ in range(4):
-                check_cancelled(cancel_callback)
-                time.sleep(0.5)
-
-        if successful_downloads == 0:
-            raise RuntimeError("No airport exports were downloaded")
-
-        check_cancelled(cancel_callback)
-        emit(progress_callback, "Merging Excel exports", 84)
-        output_name = f"TRF007_{successful_downloads}airports_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        merged_file = merge_excel_files(config.download_dir, output_filename=output_name)
-        if not merged_file:
-            raise RuntimeError("Downloaded files could not be merged")
-
-        if upload_dropbox:
-            emit(progress_callback, "Uploading merged file to Dropbox", 92)
-            upload_to_dropbox(config, merged_file)
-
-        result = {
-            "merged_file": str(merged_file),
-            "successful_downloads": successful_downloads,
-            "failed_downloads": failed_downloads,
-            "airports": selected_airports,
-            "start_date": icargo_start_date,
-            "end_date": icargo_end_date,
-        }
-
-        if send_email:
-            send_notification_email(
-                config,
-                success=True,
-                details=json.dumps(result, indent=2),
-            )
-
-        emit(progress_callback, "Download workflow completed", 100)
-        return result
-
-    except Exception as exc:
-        if send_email:
-            try:
-                send_notification_email(config, success=False, details=str(exc))
-            except Exception:
-                logger.exception("Failed to send failure notification email")
-        raise
-    finally:
-        if driver:
-            driver.quit()
-            logger.info("Browser closed")
-        logger.removeHandler(file_handler)
-        file_handler.close()
-
-
-def split_airports(value: str | None) -> list[str] | None:
+def parse_iso_date(value: str, field_name: str) -> datetime.date:
     if not value:
-        return None
-    return [part.strip().upper() for part in value.split(",") if part.strip()]
+        raise ValueError(f"{field_name} is required")
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be in YYYY-MM-DD format") from exc
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Avianca iCargo TRF007 downloader")
-    subparsers = parser.add_subparsers(dest="command")
+def add_job_log(job_id: str, message: str, progress: int | None = None) -> None:
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return
+        job["logs"].append(
+            {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "message": message,
+            }
+        )
+        job["logs"] = job["logs"][-300:]
+        if progress is not None:
+            job["progress"] = max(0, min(100, int(progress)))
+        job["updated_at"] = now_iso()
 
-    run_parser = subparsers.add_parser("run", help="Run a download immediately")
-    run_parser.add_argument("--airports", help="Comma-separated airport codes. Defaults to all configured airports.")
-    run_parser.add_argument("--start-date", help="Start date in YYYY-MM-DD format. Defaults to today.")
-    run_parser.add_argument("--end-date", help="End date in YYYY-MM-DD format. Defaults to start date + 15 days.")
-    run_parser.add_argument("--download-dir", help="Folder for exports and merged file.")
-    run_parser.add_argument("--upload-dropbox", action="store_true", help="Upload the merged file to Dropbox.")
-    run_parser.add_argument("--send-email", action="store_true", help="Send completion/failure email notification.")
 
-    args = parser.parse_args()
-    if args.command != "run":
-        parser.print_help()
-        return
+def public_job(job: dict) -> dict:
+    response = {
+        "id": job["id"],
+        "status": job["status"],
+        "progress": job["progress"],
+        "logs": job["logs"],
+        "createdAt": job["created_at"],
+        "updatedAt": job["updated_at"],
+        "airports": job["airports"],
+        "startDate": job["start_date"],
+        "endDate": job["end_date"],
+        "error": job.get("error"),
+        "result": job.get("result"),
+        "cancelRequested": bool(job.get("cancel_requested")),
+    }
+    if job["status"] == "completed":
+        response["downloadUrl"] = f"/api/jobs/{job['id']}/file"
+    return response
+
+
+def find_active_job_locked() -> dict | None:
+    for job in JOBS.values():
+        if job["status"] in {"queued", "running", "cancelling"}:
+            return job
+    return None
+
+
+def cleanup_old_jobs() -> None:
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=JOB_TTL_HOURS)
+    stale_jobs = []
+
+    with JOB_LOCK:
+        for job_id, job in list(JOBS.items()):
+            if job["status"] in {"queued", "running", "cancelling"}:
+                continue
+            updated_at = datetime.fromisoformat(job["updated_at"])
+            if updated_at < cutoff:
+                stale_jobs.append((job_id, Path(job["work_dir"])))
+                JOBS.pop(job_id, None)
+
+    for _, work_dir in stale_jobs:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+@app.after_request
+def disable_response_cache(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
+
+
+def load_downloader_function():
+    try:
+        downloader = importlib.import_module("tariff_downloader")
+    except Exception as exc:
+        raise RuntimeError(f"Could not import tariff_downloader.py: {exc}") from exc
+
+    workflow = getattr(downloader, "run_download_workflow", None)
+    if not callable(workflow):
+        source_path = getattr(downloader, "__file__", "unknown path")
+        build_version = getattr(downloader, "DOWNLOADER_BUILD_VERSION", "missing")
+        raise RuntimeError(
+            "Railway is running the wrong tariff_downloader.py. "
+            f"Expected run_download_workflow, but it was not found in {source_path}. "
+            f"Downloader build marker: {build_version}. "
+            "Push/redeploy the latest tariff_downloader.py from the fixed project folder."
+        )
+
+    return workflow
+
+
+def run_job(job_id: str) -> None:
+    with JOB_LOCK:
+        job = JOBS[job_id]
+        if job.get("cancel_requested"):
+            job["status"] = "cancelled"
+            job["progress"] = 0
+            job["updated_at"] = now_iso()
+            return
+
+        job["status"] = "running"
+        job["progress"] = 1
+        job["updated_at"] = now_iso()
+        airports = list(job["airports"])
+        start_date = job["start_date"]
+        end_date = job["end_date"]
+        download_dir = Path(job["download_dir"])
+        cancel_event = job["cancel_event"]
+
+    add_job_log(job_id, "Job started", 1)
 
     try:
+        run_download_workflow = load_downloader_function()
+
         result = run_download_workflow(
-            airports=split_airports(args.airports),
-            start_date=args.start_date,
-            end_date=args.end_date,
-            download_dir=args.download_dir,
-            upload_dropbox=args.upload_dropbox,
-            send_email=args.send_email,
+            airports=airports,
+            start_date=start_date,
+            end_date=end_date,
+            download_dir=download_dir,
+            upload_dropbox=env_flag("UPLOAD_TO_DROPBOX"),
+            send_email=env_flag("SEND_NOTIFICATION_EMAIL"),
+            progress_callback=lambda message, progress=None: add_job_log(job_id, message, progress),
+            cancel_callback=cancel_event.is_set,
         )
-        print(result["merged_file"])
+
+        with JOB_LOCK:
+            job = JOBS[job_id]
+            if job.get("cancel_requested"):
+                job["status"] = "cancelled"
+                job["updated_at"] = now_iso()
+                return
+
+            job["status"] = "completed"
+            job["progress"] = 100
+            job["result"] = {
+                "successfulDownloads": result["successful_downloads"],
+                "failedDownloads": result["failed_downloads"],
+                "fileName": Path(result["merged_file"]).name,
+            }
+            job["file_path"] = result["merged_file"]
+            job["updated_at"] = now_iso()
+        add_job_log(job_id, "Merged file is ready", 100)
+
     except Exception as exc:
-        logger.error("Workflow failed: %s", exc)
-        sys.exit(1)
+        logger.exception("Job %s failed", job_id)
+        with JOB_LOCK:
+            job = JOBS[job_id]
+            if job.get("cancel_requested"):
+                job["status"] = "cancelled"
+                job["error"] = None
+            else:
+                job["status"] = "failed"
+                job["error"] = str(exc)
+            job["updated_at"] = now_iso()
+        if cancel_event.is_set():
+            add_job_log(job_id, "Job cancelled")
+        else:
+            add_job_log(job_id, f"Job failed: {exc}")
+
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
+@app.route("/api/status")
+def status():
+    with JOB_LOCK:
+        active_job = find_active_job_locked()
+        active_job_id = active_job["id"] if active_job else None
+    return jsonify({"status": "ok", "timestamp": now_iso(), "activeJobId": active_job_id})
+
+
+@app.route("/api/diagnostics")
+def diagnostics():
+    downloader_info = {
+        "importOk": False,
+        "path": None,
+        "buildVersion": None,
+        "hasRunDownloadWorkflow": False,
+        "error": None,
+    }
+
+    try:
+        downloader = importlib.import_module("tariff_downloader")
+        downloader_info.update(
+            {
+                "importOk": True,
+                "path": getattr(downloader, "__file__", None),
+                "buildVersion": getattr(downloader, "DOWNLOADER_BUILD_VERSION", "missing"),
+                "hasRunDownloadWorkflow": callable(getattr(downloader, "run_download_workflow", None)),
+            }
+        )
+    except Exception as exc:
+        downloader_info["error"] = str(exc)
+
+    return jsonify(
+        {
+            "appBuildVersion": APP_BUILD_VERSION,
+            "clientVersion": CLIENT_VERSION,
+            "downloader": downloader_info,
+            "environment": {
+                "hasAviancaEmail": bool(os.getenv("AVIANCA_EMAIL")),
+                "hasGmailEmail": bool(os.getenv("GMAIL_EMAIL")),
+                "hasGmailAppPassword": bool(os.getenv("GMAIL_APP_PASSWORD") or os.getenv("GMAIL_PASSWORD")),
+            },
+            "chrome": binary_diagnostics(),
+        }
+    )
+
+
+def command_version(command: str | None) -> str | None:
+    if not command:
+        return None
+    try:
+        result = subprocess.run(
+            [command, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        output = (result.stdout or result.stderr).strip()
+        return output or f"exit code {result.returncode}"
+    except Exception as exc:
+        return f"error: {exc}"
+
+
+def binary_diagnostics() -> dict:
+    chromium_path = shutil.which("chromium") or shutil.which("chromium-browser") or shutil.which("google-chrome")
+    chromedriver_path = shutil.which("chromedriver")
+    return {
+        "chromeBinEnv": os.getenv("CHROME_BIN") or os.getenv("GOOGLE_CHROME_BIN"),
+        "chromiumPath": chromium_path,
+        "chromiumVersion": command_version(chromium_path),
+        "chromedriverPath": chromedriver_path,
+        "chromedriverVersion": command_version(chromedriver_path),
+    }
+
+
+@app.route("/api/download", methods=["POST"])
+def start_download():
+    cleanup_old_jobs()
+
+    try:
+        data = request.get_json(silent=True) or {}
+        if request.headers.get("X-Client-Version") != CLIENT_VERSION:
+            return (
+                jsonify({"error": "Please refresh the page before starting a download."}),
+                426,
+            )
+
+        module = data.get("module", "TRF007")
+        airports = [str(code).strip().upper() for code in data.get("airports", []) if str(code).strip()]
+        start_date = data.get("startDate")
+        end_date = data.get("endDate")
+
+        if module != "TRF007":
+            return jsonify({"error": "Only TRF007 is currently supported"}), 400
+        if not airports:
+            return jsonify({"error": "No airports selected"}), 400
+
+        allowed_airports = set(DEFAULT_AIRPORTS)
+        invalid_airports = sorted(set(airports) - allowed_airports)
+        if invalid_airports:
+            return jsonify({"error": f"Invalid airports: {', '.join(invalid_airports)}"}), 400
+
+        start = parse_iso_date(start_date, "startDate")
+        end = parse_iso_date(end_date, "endDate")
+        days = (end - start).days
+        if days < 0:
+            return jsonify({"error": "End date must be on or after start date"}), 400
+        if days > MAX_RANGE_DAYS:
+            return jsonify({"error": f"Date range cannot exceed {MAX_RANGE_DAYS} days"}), 400
+
+        with JOB_LOCK:
+            active_job = find_active_job_locked()
+            if active_job:
+                return (
+                    jsonify(
+                        {
+                            "error": "Another download is already running. Please wait for it to finish.",
+                            "activeJob": public_job(active_job),
+                        }
+                    ),
+                    409,
+                )
+
+            job_id = uuid.uuid4().hex
+            work_dir = TEMP_DIR / job_id
+            download_dir = work_dir / "files"
+            download_dir.mkdir(parents=True, exist_ok=True)
+            cancel_event = threading.Event()
+
+            JOBS[job_id] = {
+                "id": job_id,
+                "status": "queued",
+                "progress": 0,
+                "logs": [],
+                "created_at": now_iso(),
+                "updated_at": now_iso(),
+                "airports": airports,
+                "start_date": start_date,
+                "end_date": end_date,
+                "work_dir": str(work_dir),
+                "download_dir": str(download_dir),
+                "file_path": None,
+                "result": None,
+                "error": None,
+                "cancel_requested": False,
+                "cancel_event": cancel_event,
+                "future": None,
+            }
+
+        with JOB_LOCK:
+            JOBS[job_id]["future"] = EXECUTOR.submit(run_job, job_id)
+            job = public_job(JOBS[job_id])
+        return jsonify(job), 202
+
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        logger.exception("Could not start download")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/jobs/<job_id>")
+def get_job(job_id: str):
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify(public_job(job))
+
+
+@app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
+def cancel_job(job_id: str):
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+
+        if job["status"] in {"completed", "failed", "cancelled"}:
+            return jsonify(public_job(job))
+
+        job["cancel_requested"] = True
+        job["cancel_event"].set()
+        future = job.get("future")
+        if job["status"] == "queued" and future and future.cancel():
+            job["status"] = "cancelled"
+        else:
+            job["status"] = "cancelling"
+
+        job["updated_at"] = now_iso()
+
+    add_job_log(job_id, "Abort requested")
+    with JOB_LOCK:
+        return jsonify(public_job(JOBS[job_id]))
+
+
+@app.route("/api/jobs/<job_id>/file")
+def download_job_file(job_id: str):
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job["status"] != "completed":
+            return jsonify({"error": "Job is not complete yet"}), 409
+        file_path = Path(job["file_path"])
+        filename = (
+            f"TRF007_{job['result']['successfulDownloads']}airports_"
+            f"{job['start_date']}_to_{job['end_date']}.xlsx"
+        )
+
+    if not file_path.exists():
+        return jsonify({"error": "Generated file is no longer available"}), 410
+
+    return send_file(
+        str(file_path),
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.errorhandler(404)
+def not_found(_):
+    return jsonify({"error": "Not found"}), 404
+
+
+@app.errorhandler(500)
+def server_error(error):
+    logger.error("Server error: %s", error)
+    return jsonify({"error": "Server error"}), 500
 
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 5000))
+    logger.info("Starting on port %s", port)
+    app.run(host="0.0.0.0", port=port, debug=False)
