@@ -73,7 +73,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v4-email-search"
+DOWNLOADER_BUILD_VERSION = "job-api-v5-login-progress"
 
 ProgressCallback = Callable[[str, int | None], None]
 CancelCallback = Callable[[], bool]
@@ -278,14 +278,17 @@ def get_verification_code_from_email(
     timeout_seconds: int = 300,
     cancel_callback: CancelCallback | None = None,
     requested_after: datetime | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> str:
     logger.info("Waiting for verification code email")
+    emit(progress_callback, "Connecting to Gmail for verification code", 12)
     mail = None
 
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(config.gmail_email, config.gmail_app_password)
         mail.select("INBOX")
+        emit(progress_callback, "Gmail connected; scanning Microsoft emails", 12)
 
         start_time = time.time()
         if requested_after is None:
@@ -317,6 +320,7 @@ def get_verification_code_from_email(
                     "Found %s candidate verification email(s), checking newest first",
                     len(email_ids),
                 )
+                emit(progress_callback, f"Checking {len(email_ids)} Microsoft email candidate(s)", 12)
                 for email_id in reversed(email_ids[-50:]):
                     status, msg_data = mail.fetch(email_id, "(RFC822)")
                     if status != "OK" or not msg_data:
@@ -340,6 +344,7 @@ def get_verification_code_from_email(
                         mail.close()
                         mail.logout()
                         logger.info("Verification code found")
+                        emit(progress_callback, "Verification code found", 14)
                         return code
 
             elapsed = time.time() - start_time
@@ -348,6 +353,7 @@ def get_verification_code_from_email(
                 last_search_window_change = elapsed
 
             logger.info("No verification code yet (%ss / %ss)", int(elapsed), timeout_seconds)
+            emit(progress_callback, f"Still waiting for verification code ({int(elapsed)}s)", 12)
             time.sleep(5)
 
         raise TimeoutException("Verification code email not received")
@@ -459,19 +465,23 @@ def login_to_avianca(
     driver: webdriver.Chrome,
     config: DownloaderConfig,
     cancel_callback: CancelCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> bool:
     try:
         check_cancelled(cancel_callback)
         logger.info("Navigating to Avianca iCargo login page")
+        emit(progress_callback, "Opening Avianca login page", 9)
         driver.get(LOGIN_URL)
         wait = WebDriverWait(driver, 20)
 
+        emit(progress_callback, "Looking for login email field", 10)
         try:
             email_field = wait.until(EC.presence_of_element_located((By.ID, "cred_userid_inputtext")))
         except TimeoutException:
             email_field = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='email']")))
         email_field.clear()
         email_field.send_keys(config.avianca_email)
+        emit(progress_callback, "Email entered; looking for Next button", 11)
 
         try:
             next_button = wait.until(EC.element_to_be_clickable((By.ID, "idSIButton9")))
@@ -480,6 +490,7 @@ def login_to_avianca(
 
         code_requested_at = datetime.now(timezone.utc) - timedelta(seconds=20)
         next_button.click()
+        emit(progress_callback, "Verification code requested from Microsoft", 12)
 
         time.sleep(3)
         code = None
@@ -487,16 +498,19 @@ def login_to_avianca(
             check_cancelled(cancel_callback)
             try:
                 logger.info("Waiting for verification code attempt %s/3", attempt)
+                emit(progress_callback, f"Waiting for verification code attempt {attempt}/3", 12)
                 code = get_verification_code_from_email(
                     config,
                     timeout_seconds=300,
                     cancel_callback=cancel_callback,
                     requested_after=code_requested_at,
+                    progress_callback=progress_callback,
                 )
                 break
             except TimeoutException:
                 if attempt == 3:
                     raise
+                emit(progress_callback, "Verification code timed out; trying email scan again", 12)
                 time.sleep(5)
 
         if not code:
@@ -506,10 +520,12 @@ def login_to_avianca(
             code_field = wait.until(EC.presence_of_element_located((By.ID, "idTxtBx_OTC_Password")))
         except TimeoutException:
             code_field = wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='Code']")))
+        emit(progress_callback, "Entering verification code", 15)
         code_field.send_keys(code)
 
         signin_button = wait.until(EC.element_to_be_clickable((By.ID, "idSIButton9")))
         signin_button.click()
+        emit(progress_callback, "Verification submitted; waiting for iCargo", 16)
 
         try:
             stay_signed_in_no = WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.ID, "idBtn_Back")))
@@ -520,6 +536,7 @@ def login_to_avianca(
         time.sleep(6)
         if "showMainPage" not in driver.current_url and "icargo" not in driver.current_url:
             logger.error("Login may have failed. Current URL: %s", driver.current_url)
+            emit(progress_callback, f"Login redirect did not reach iCargo: {driver.current_url}", 16)
             return False
 
         all_windows = driver.window_handles
@@ -528,8 +545,9 @@ def login_to_avianca(
             time.sleep(2)
 
         return True
-    except Exception:
+    except Exception as exc:
         logger.exception("Login failed")
+        emit(progress_callback, f"Login failed: {exc}", 16)
         return False
 
 
@@ -845,7 +863,12 @@ def prepare_icargo_session(
             emit(progress_callback, "Chrome started", 8)
 
             check_cancelled(cancel_callback)
-            if not login_to_avianca(driver, config, cancel_callback=cancel_callback):
+            if not login_to_avianca(
+                driver,
+                config,
+                cancel_callback=cancel_callback,
+                progress_callback=progress_callback,
+            ):
                 raise RuntimeError("Failed to login to Avianca iCargo")
             emit(progress_callback, "Logged in to iCargo", 18)
 
