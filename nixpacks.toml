@@ -1,21 +1,30 @@
-[build]
-[build.variables]
+[variables]
 NIXPACKS_METADATA = "python"
+NIXPACKS_PYTHON_VERSION = "3.10"
+PYTHONUNBUFFERED = "1"
 
-[build.nixpkgs]
-packages = [
+[phases.setup]
+nixPkgs = [
     "python310",
     "chromium",
-    "libxkbcommon",
-    "libxcb",
+    "chromedriver",
     "gcc",
 ]
 
-[build.onlyIncludeFiles]
-paths = [
+[phases.install]
+cmds = ["pip install -r requirements.txt"]
+
+[start]
+cmd = "python app.py"
+
+[build]
+onlyIncludeFiles = [
     "app.py",
     "tariff_downloader.py",
     "requirements.txt",
     "templates/",
     "Procfile",
+    "runtime.txt",
+    "railway.toml",
+    "nixpacks.toml",
 ]
