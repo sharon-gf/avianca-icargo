@@ -17,7 +17,32 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from tariff_downloader import DEFAULT_AIRPORTS, MAX_RANGE_DAYS, run_download_workflow
+DEFAULT_AIRPORTS = [
+    "CAN",
+    "HKG",
+    "NGO",
+    "ISB",
+    "XMN",
+    "CGK",
+    "ICN",
+    "TPE",
+    "CGO",
+    "DPS",
+    "GMP",
+    "HAN",
+    "PEK",
+    "NRT",
+    "MFM",
+    "SGN",
+    "PVG",
+    "HND",
+    "KHI",
+    "DAD",
+    "SZX",
+    "KIX",
+    "LHE",
+]
+MAX_RANGE_DAYS = 15
 
 
 logging.basicConfig(level=logging.INFO)
@@ -118,6 +143,8 @@ def cleanup_old_jobs() -> None:
 
 
 def run_job(job_id: str) -> None:
+    from tariff_downloader import run_download_workflow
+
     with JOB_LOCK:
         job = JOBS[job_id]
         job["status"] = "running"
