@@ -75,8 +75,9 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v14-keep-trf007-open"
+DOWNLOADER_BUILD_VERSION = "job-api-v15-export-settle-retry"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
+EXPORT_SETTLE_SECONDS = 5
 VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
 
 ProgressCallback = Callable[[str, int | None], None]
@@ -948,37 +949,41 @@ def download_results_as_excel(
             for path in download_dir.glob(f"*{suffix}")
         }
 
-        for attempt in range(1, 3):
-            check_cancelled(cancel_callback)
-            wait = enter_trf007_frame(driver, timeout=20)
-            wait_for_icargo_idle(driver, timeout=20, cancel_callback=cancel_callback)
+        check_cancelled(cancel_callback)
+        wait = enter_trf007_frame(driver, timeout=20)
+        wait_for_icargo_idle(driver, timeout=20, cancel_callback=cancel_callback)
 
-            try:
-                export_link = wait.until(lambda current_driver: visible_export_link(current_driver))
-            except TimeoutException:
-                driver.switch_to.default_content()
-                emit(progress_callback, f"{airport}: export link did not appear", None)
-                return None
-
-            click_time = time.time()
-            click_method = click_export_link(driver, export_link)
+        try:
+            export_link = wait.until(lambda current_driver: visible_export_link(current_driver))
+        except TimeoutException:
             driver.switch_to.default_content()
-            emit(progress_callback, f"{airport}: export clicked ({click_method}); waiting for Excel file", None)
+            emit(progress_callback, f"{airport}: export link did not appear", None)
+            return None
 
-            downloaded_file = wait_for_new_download(
-                download_dir,
-                existing_names,
-                click_time,
-                timeout=50,
-                cancel_callback=cancel_callback,
-                progress_callback=progress_callback,
-                airport=airport,
-            )
-            if downloaded_file:
-                return downloaded_file
+        emit(progress_callback, f"{airport}: export is visible; waiting {EXPORT_SETTLE_SECONDS}s before click", None)
+        driver.switch_to.default_content()
+        for _ in range(EXPORT_SETTLE_SECONDS):
+            check_cancelled(cancel_callback)
+            time.sleep(1)
 
-            if attempt == 1:
-                emit(progress_callback, f"{airport}: no file appeared; retrying export click", None)
+        wait = enter_trf007_frame(driver, timeout=20)
+        export_link = wait.until(lambda current_driver: visible_export_link(current_driver))
+        click_time = time.time()
+        click_method = click_export_link(driver, export_link)
+        driver.switch_to.default_content()
+        emit(progress_callback, f"{airport}: export clicked ({click_method}); waiting for Excel file", None)
+
+        downloaded_file = wait_for_new_download(
+            download_dir,
+            existing_names,
+            click_time,
+            timeout=60,
+            cancel_callback=cancel_callback,
+            progress_callback=progress_callback,
+            airport=airport,
+        )
+        if downloaded_file:
+            return downloaded_file
 
         return None
     except Exception:
@@ -1253,10 +1258,15 @@ def run_download_workflow(
             downloaded_file = None
             last_failure = "download did not complete"
 
-            for attempt in range(1, 3):
+            max_airport_attempts = 3
+            for attempt in range(1, max_airport_attempts + 1):
                 check_cancelled(cancel_callback)
                 if attempt > 1:
-                    emit(progress_callback, f"{airport}: retrying from a fresh TRF007 screen ({attempt}/2)", base_progress)
+                    emit(
+                        progress_callback,
+                        f"{airport}: retrying from a fresh TRF007 screen ({attempt}/{max_airport_attempts})",
+                        base_progress,
+                    )
                     if not navigate_to_screen(driver, "TRF007"):
                         last_failure = "could not reopen TRF007"
                         continue
@@ -1296,6 +1306,8 @@ def run_download_workflow(
                     break
 
                 last_failure = "export failed or timed out"
+                if attempt < max_airport_attempts:
+                    emit(progress_callback, f"{airport}: no Excel file appeared; retrying full airport query", base_progress)
 
             if not downloaded_file:
                 failed_downloads += 1
