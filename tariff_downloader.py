@@ -32,6 +32,7 @@ import pandas as pd
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -74,7 +75,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v9-trf007-export-retry"
+DOWNLOADER_BUILD_VERSION = "job-api-v11-export-real-click"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
 
@@ -287,11 +288,31 @@ def get_verification_code_from_email(
     emit(progress_callback, "Connecting to Gmail for verification code", 12)
     mail = None
 
-    try:
+    def close_mail() -> None:
+        nonlocal mail
+        if not mail:
+            return
+        try:
+            mail.close()
+        except Exception:
+            pass
+        try:
+            mail.logout()
+        except Exception:
+            pass
+        mail = None
+
+    def connect_mail(show_progress: bool = True) -> None:
+        nonlocal mail
+        close_mail()
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(config.gmail_email, config.gmail_app_password)
-        mail.select("INBOX")
-        emit(progress_callback, "Gmail connected; scanning Microsoft emails", 12)
+        mail.select("INBOX", readonly=True)
+        if show_progress:
+            emit(progress_callback, "Gmail connected; scanning Microsoft emails", 12)
+
+    try:
+        connect_mail()
 
         start_time = time.time()
         if requested_after is None:
@@ -301,10 +322,26 @@ def get_verification_code_from_email(
 
         time_windows = [30, 60, 120, 240]
         current_window_idx = 0
-        last_search_window_change = start_time
+        last_search_window_change = 0.0
+        last_reconnect_at = 0.0
 
         while time.time() - start_time < timeout_seconds:
             check_cancelled(cancel_callback)
+            elapsed = time.time() - start_time
+
+            if elapsed - last_reconnect_at >= 35:
+                emit(progress_callback, "Refreshing Gmail connection", 12)
+                connect_mail(show_progress=False)
+                last_reconnect_at = elapsed
+            else:
+                try:
+                    mail.noop()
+                    mail.select("INBOX", readonly=True)
+                except imaplib.IMAP4.abort:
+                    emit(progress_callback, "Gmail connection refreshed after mailbox delay", 12)
+                    connect_mail(show_progress=False)
+                    last_reconnect_at = elapsed
+
             minutes_ago = time_windows[min(current_window_idx, len(time_windows) - 1)]
             since_date = datetime.now() - timedelta(minutes=minutes_ago)
             since_str = since_date.strftime("%d-%b-%Y")
@@ -358,8 +395,7 @@ def get_verification_code_from_email(
                         logger.debug("Stopping at old candidate email: %s", email_date.isoformat())
                         break
 
-                    mail.close()
-                    mail.logout()
+                    close_mail()
                     logger.info(
                         "Verification code found from email dated %s with subject %s",
                         email_date.isoformat(),
@@ -388,18 +424,8 @@ def get_verification_code_from_email(
 
         raise TimeoutException("Verification code email not received")
 
-    except imaplib.IMAP4.abort:
-        raise
     finally:
-        if mail:
-            try:
-                mail.close()
-            except Exception:
-                pass
-            try:
-                mail.logout()
-            except Exception:
-                pass
+        close_mail()
 
 
 def parse_email_date(msg: email.message.Message) -> datetime | None:
@@ -735,6 +761,26 @@ def visible_export_link(driver: webdriver.Chrome):
     )
 
 
+def click_export_link(driver: webdriver.Chrome, export_link) -> str:
+    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", export_link)
+    time.sleep(0.5)
+
+    try:
+        export_link.click()
+        return "browser click"
+    except Exception as first_exc:
+        logger.info("Normal export click failed, trying ActionChains click: %s", first_exc)
+
+    try:
+        ActionChains(driver).move_to_element(export_link).pause(0.2).click().perform()
+        return "action click"
+    except Exception as second_exc:
+        logger.info("ActionChains export click failed, trying JavaScript click: %s", second_exc)
+
+    driver.execute_script("arguments[0].click();", export_link)
+    return "javascript click"
+
+
 def wait_for_query_results(
     driver: webdriver.Chrome,
     airport: str,
@@ -908,17 +954,15 @@ def download_results_as_excel(
                 return None
 
             click_time = time.time()
-            driver.execute_script("arguments[0].scrollIntoView(true);", export_link)
-            time.sleep(0.5)
-            driver.execute_script("arguments[0].click();", export_link)
+            click_method = click_export_link(driver, export_link)
             driver.switch_to.default_content()
-            emit(progress_callback, f"{airport}: export clicked; waiting for Excel file", None)
+            emit(progress_callback, f"{airport}: export clicked ({click_method}); waiting for Excel file", None)
 
             downloaded_file = wait_for_new_download(
                 download_dir,
                 existing_names,
                 click_time,
-                timeout=120,
+                timeout=50,
                 cancel_callback=cancel_callback,
                 progress_callback=progress_callback,
                 airport=airport,
