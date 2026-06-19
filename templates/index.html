@@ -155,14 +155,58 @@
 
         .airports-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
-            gap: 8px;
+            gap: 12px;
             max-height: 220px;
             overflow-y: auto;
             border: 1px solid #d8dee8;
             border-radius: 8px;
             background: #f8fafc;
             padding: 12px;
+        }
+
+        .country-group {
+            display: grid;
+            gap: 8px;
+        }
+
+        .country-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            color: #172033;
+            font-size: 12px;
+            font-weight: 800;
+            text-transform: uppercase;
+        }
+
+        .country-title label {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            margin: 0;
+            cursor: pointer;
+            font-size: inherit;
+            font-weight: inherit;
+        }
+
+        .country-title input {
+            width: 15px;
+            height: 15px;
+            accent-color: #b4172a;
+        }
+
+        .country-airports {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+            gap: 8px;
+            border-bottom: 1px solid #e3e8f0;
+            padding-bottom: 10px;
+        }
+
+        .country-group:last-child .country-airports {
+            border-bottom: 0;
+            padding-bottom: 0;
         }
 
         .airport-label {
@@ -173,7 +217,7 @@
             color: #283449;
             cursor: pointer;
             font-size: 13px;
-            font-weight: 600;
+            font-weight: 400;
             user-select: none;
         }
 
@@ -383,12 +427,24 @@
     </main>
 
     <script>
-        const AIRPORTS = [
-            "CAN", "HKG", "NGO", "ISB", "XMN", "CGK", "ICN", "TPE",
-            "CGO", "DPS", "GMP", "HAN", "PEK", "NRT", "MFM", "SGN",
-            "PVG", "HND", "KHI", "DAD", "SZX", "KIX", "LHE"
+        const AIRPORT_GROUPS = [
+            { country: "China", airports: ["CAN", "CGO", "PEK", "PVG", "SZX", "XMN"] },
+            { country: "Hong Kong", airports: ["HKG"] },
+            { country: "Indonesia", airports: ["CGK", "DPS"] },
+            { country: "Japan", airports: ["HND", "KIX", "NGO", "NRT"] },
+            { country: "Macau", airports: ["MFM"] },
+            { country: "Pakistan", airports: ["ISB", "KHI", "LHE"] },
+            { country: "South Korea", airports: ["GMP", "ICN"] },
+            { country: "Taiwan", airports: ["TPE"] },
+            { country: "Vietnam", airports: ["DAD", "HAN", "SGN"] }
         ];
         const MAX_RANGE_DAYS = 15;
+        const logTimeFormatter = new Intl.DateTimeFormat([], {
+            hour: "2-digit",
+            minute: "2-digit",
+            second: "2-digit",
+            hour12: false
+        });
 
         let pollTimer = null;
         let activeJobId = null;
@@ -427,20 +483,61 @@
 
         function initAirports() {
             const grid = document.getElementById("airportsGrid");
-            AIRPORTS.forEach((airport) => {
-                const label = document.createElement("label");
-                label.className = "airport-label";
-                label.innerHTML = `
-                    <input type="checkbox" class="airport-checkbox" value="${airport}" checked>
-                    <span>${airport}</span>
+            AIRPORT_GROUPS.forEach((group, groupIndex) => {
+                const section = document.createElement("section");
+                section.className = "country-group";
+                section.innerHTML = `
+                    <div class="country-title">
+                        <label>
+                            <input type="checkbox" class="country-checkbox" data-group-index="${groupIndex}" checked>
+                            <span>${group.country}</span>
+                        </label>
+                    </div>
+                    <div class="country-airports"></div>
                 `;
-                grid.appendChild(label);
+
+                const countryAirports = section.querySelector(".country-airports");
+                group.airports.forEach((airport) => {
+                    const label = document.createElement("label");
+                    label.className = "airport-label";
+                    label.innerHTML = `
+                        <input type="checkbox" class="airport-checkbox" value="${airport}" data-group-index="${groupIndex}" checked>
+                        <span>${airport}</span>
+                    `;
+                    countryAirports.appendChild(label);
+                });
+                grid.appendChild(section);
             });
 
             document.querySelectorAll(".airport-checkbox").forEach((checkbox) => {
-                checkbox.addEventListener("change", updateSelectedCount);
+                checkbox.addEventListener("change", () => {
+                    syncCountryCheckbox(Number(checkbox.dataset.groupIndex));
+                    updateSelectedCount();
+                });
+            });
+
+            document.querySelectorAll(".country-checkbox").forEach((checkbox) => {
+                checkbox.addEventListener("change", () => {
+                    const groupIndex = Number(checkbox.dataset.groupIndex);
+                    document.querySelectorAll(`.airport-checkbox[data-group-index="${groupIndex}"]`).forEach((airportCheckbox) => {
+                        airportCheckbox.checked = checkbox.checked;
+                    });
+                    updateSelectedCount();
+                });
             });
             updateSelectedCount();
+        }
+
+        function syncCountryCheckbox(groupIndex) {
+            const countryCheckbox = document.querySelector(`.country-checkbox[data-group-index="${groupIndex}"]`);
+            const airportCheckboxes = Array.from(document.querySelectorAll(`.airport-checkbox[data-group-index="${groupIndex}"]`));
+            const checkedCount = airportCheckboxes.filter((checkbox) => checkbox.checked).length;
+            countryCheckbox.checked = checkedCount === airportCheckboxes.length;
+            countryCheckbox.indeterminate = checkedCount > 0 && checkedCount < airportCheckboxes.length;
+        }
+
+        function syncAllCountryCheckboxes() {
+            AIRPORT_GROUPS.forEach((_, groupIndex) => syncCountryCheckbox(groupIndex));
         }
 
         function updateSelectedCount() {
@@ -650,11 +747,23 @@
 
             logList.innerHTML = job.logs.map((entry) => `
                 <div class="log-item">
-                    <span class="log-time">${entry.time}</span>
+                    <span class="log-time">${formatLogTime(entry)}</span>
                     <span>${escapeHtml(entry.message)}</span>
                 </div>
             `).join("");
             logList.scrollTop = logList.scrollHeight;
+        }
+
+        function formatLogTime(entry) {
+            if (!entry.timeUtc) {
+                return entry.time || "";
+            }
+
+            const date = new Date(entry.timeUtc);
+            if (Number.isNaN(date.getTime())) {
+                return entry.time || "";
+            }
+            return logTimeFormatter.format(date);
         }
 
         function escapeHtml(value) {
@@ -670,6 +779,7 @@
             document.querySelectorAll(".airport-checkbox").forEach((checkbox) => {
                 checkbox.checked = true;
             });
+            syncAllCountryCheckboxes();
             updateSelectedCount();
         });
 
@@ -677,6 +787,7 @@
             document.querySelectorAll(".airport-checkbox").forEach((checkbox) => {
                 checkbox.checked = false;
             });
+            syncAllCountryCheckboxes();
             updateSelectedCount();
         });
 
