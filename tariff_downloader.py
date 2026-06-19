@@ -75,7 +75,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v13-unique-files-no-rows-wait"
+DOWNLOADER_BUILD_VERSION = "job-api-v14-keep-trf007-open"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
 
@@ -1255,12 +1255,8 @@ def run_download_workflow(
 
             for attempt in range(1, 3):
                 check_cancelled(cancel_callback)
-                if index > 1 or attempt > 1:
-                    if attempt > 1:
-                        emit(progress_callback, f"{airport}: retrying from a fresh TRF007 screen ({attempt}/2)", base_progress)
-                    else:
-                        emit(progress_callback, f"{airport}: opening a fresh TRF007 screen", base_progress)
-
+                if attempt > 1:
+                    emit(progress_callback, f"{airport}: retrying from a fresh TRF007 screen ({attempt}/2)", base_progress)
                     if not navigate_to_screen(driver, "TRF007"):
                         last_failure = "could not reopen TRF007"
                         continue
