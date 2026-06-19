@@ -74,7 +74,8 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v8-body-code-email"
+DOWNLOADER_BUILD_VERSION = "job-api-v9-trf007-export-retry"
+EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
 
 ProgressCallback = Callable[[str, int | None], None]
@@ -630,17 +631,148 @@ def switch_to_comm_role(driver: webdriver.Chrome) -> bool:
 
 def navigate_to_screen(driver: webdriver.Chrome, screen_num: str = "TRF007") -> bool:
     try:
-        wait = WebDriverWait(driver, 15)
+        driver.switch_to.default_content()
+        wait = WebDriverWait(driver, 20)
         screen_field = wait.until(EC.presence_of_element_located((By.ID, "ic-screen-search")))
         screen_field.clear()
         screen_field.send_keys(screen_num)
         time.sleep(1)
         screen_field.send_keys(Keys.RETURN)
-        time.sleep(5)
+
+        if screen_num == "TRF007":
+            wait.until(EC.presence_of_element_located((By.NAME, "iCargoContentFrameTRF007")))
+        time.sleep(2)
         return True
     except Exception:
         logger.exception("Could not navigate to screen %s", screen_num)
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
         return False
+
+
+def enter_trf007_frame(driver: webdriver.Chrome, timeout: int = 20) -> WebDriverWait:
+    driver.switch_to.default_content()
+    wait = WebDriverWait(driver, timeout)
+    iframe = wait.until(EC.presence_of_element_located((By.NAME, "iCargoContentFrameTRF007")))
+    driver.switch_to.frame(iframe)
+    return wait
+
+
+def wait_for_icargo_idle(
+    driver: webdriver.Chrome,
+    timeout: int = 45,
+    cancel_callback: CancelCallback | None = None,
+) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        check_cancelled(cancel_callback)
+        try:
+            is_idle = driver.execute_script(
+                """
+                const selectors = [
+                    '.blockUI',
+                    '.blockOverlay',
+                    '.loading',
+                    '.spinner',
+                    '[id*="loading" i]',
+                    '[class*="loading" i]',
+                    '[class*="progress" i]'
+                ];
+                function visible(el) {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        Number(style.opacity || 1) > 0 &&
+                        rect.width > 0 &&
+                        rect.height > 0;
+                }
+                return selectors.every((selector) =>
+                    Array.from(document.querySelectorAll(selector)).every((el) => !visible(el))
+                );
+                """
+            )
+            if is_idle:
+                return True
+        except Exception:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def visible_export_link(driver: webdriver.Chrome):
+    return driver.execute_script(
+        """
+        function visible(el) {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                Number(style.opacity || 1) > 0 &&
+                rect.width > 0 &&
+                rect.height > 0 &&
+                !el.disabled;
+        }
+        const candidates = [
+            document.querySelector('#exportToExcelLink'),
+            ...Array.from(document.querySelectorAll('a, button, input')).filter((el) => {
+                const text = [
+                    el.innerText,
+                    el.textContent,
+                    el.value,
+                    el.title,
+                    el.id,
+                    el.name
+                ].join(' ');
+                return /excel|export/i.test(text);
+            })
+        ].filter(Boolean);
+        return candidates.find(visible) || null;
+        """
+    )
+
+
+def wait_for_query_results(
+    driver: webdriver.Chrome,
+    airport: str,
+    timeout: int = 90,
+    cancel_callback: CancelCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> bool:
+    start_time = time.time()
+    last_progress_at = start_time
+
+    while time.time() - start_time < timeout:
+        check_cancelled(cancel_callback)
+        wait_for_icargo_idle(driver, timeout=3, cancel_callback=cancel_callback)
+
+        try:
+            if visible_export_link(driver):
+                return True
+
+            no_results = driver.execute_script(
+                """
+                const text = (document.body.innerText || '').toLowerCase();
+                return /no\\s+records|no\\s+data|no\\s+result|no\\s+spot\\s+rate/.test(text);
+                """
+            )
+            if no_results:
+                emit(progress_callback, f"{airport}: Avianca returned no rows", None)
+                return False
+        except Exception:
+            pass
+
+        now = time.time()
+        if now - last_progress_at >= 15:
+            elapsed = int(now - start_time)
+            emit(progress_callback, f"{airport}: still waiting for Avianca results ({elapsed}s)", None)
+            last_progress_at = now
+        time.sleep(1)
+
+    return False
 
 
 def set_date_range_and_airport(
@@ -649,13 +781,14 @@ def set_date_range_and_airport(
     is_first_airport: bool,
     start_date: str,
     end_date: str,
+    cancel_callback: CancelCallback | None = None,
 ) -> bool:
     try:
-        wait = WebDriverWait(driver, 8)
-        iframe = wait.until(EC.presence_of_element_located((By.NAME, "iCargoContentFrameTRF007")))
-        driver.switch_to.frame(iframe)
+        check_cancelled(cancel_callback)
+        wait = enter_trf007_frame(driver, timeout=20)
+        wait_for_icargo_idle(driver, timeout=20, cancel_callback=cancel_callback)
 
-        if is_first_airport:
+        if is_first_airport or start_date or end_date:
             driver.execute_script(
                 """
                 const fromDate = arguments[0];
@@ -678,6 +811,7 @@ def set_date_range_and_airport(
             )
             time.sleep(2)
 
+        check_cancelled(cancel_callback)
         origin_field = wait.until(
             EC.presence_of_element_located((By.ID, "CMP_Tariff_Freight_ListSpotRateRequests_Origin"))
         )
@@ -706,20 +840,36 @@ def set_date_range_and_airport(
         return False
 
 
-def execute_tariff_query(driver: webdriver.Chrome) -> bool:
+def execute_tariff_query(
+    driver: webdriver.Chrome,
+    airport: str,
+    cancel_callback: CancelCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> bool:
     try:
-        wait = WebDriverWait(driver, 8)
-        iframe = wait.until(EC.presence_of_element_located((By.NAME, "iCargoContentFrameTRF007")))
-        driver.switch_to.frame(iframe)
+        check_cancelled(cancel_callback)
+        wait = enter_trf007_frame(driver, timeout=20)
+        wait_for_icargo_idle(driver, timeout=20, cancel_callback=cancel_callback)
 
         list_button = wait.until(
             EC.element_to_be_clickable((By.ID, "CMP_Tariff_Freight_ListSpotRateRequests_List"))
         )
         driver.execute_script("arguments[0].scrollIntoView(true);", list_button)
         time.sleep(0.5)
-        list_button.click()
-        time.sleep(5)
+        driver.execute_script("arguments[0].click();", list_button)
+        emit(progress_callback, f"{airport}: query submitted; waiting for results", None)
 
+        if not wait_for_query_results(
+            driver,
+            airport,
+            timeout=90,
+            cancel_callback=cancel_callback,
+            progress_callback=progress_callback,
+        ):
+            driver.switch_to.default_content()
+            return False
+
+        emit(progress_callback, f"{airport}: results are ready", None)
         driver.switch_to.default_content()
         return True
     except Exception:
@@ -734,32 +884,52 @@ def execute_tariff_query(driver: webdriver.Chrome) -> bool:
 def download_results_as_excel(
     driver: webdriver.Chrome,
     download_dir: Path,
+    airport: str,
     cancel_callback: CancelCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> Path | None:
     try:
-        wait = WebDriverWait(driver, 8)
-        existing_names = {path.name for path in download_dir.glob("*.xlsx")}
-        click_time = time.time()
+        existing_names = {
+            path.name
+            for suffix in EXPORT_FILE_SUFFIXES
+            for path in download_dir.glob(f"*{suffix}")
+        }
 
-        iframe = wait.until(EC.presence_of_element_located((By.NAME, "iCargoContentFrameTRF007")))
-        driver.switch_to.frame(iframe)
+        for attempt in range(1, 3):
+            check_cancelled(cancel_callback)
+            wait = enter_trf007_frame(driver, timeout=20)
+            wait_for_icargo_idle(driver, timeout=20, cancel_callback=cancel_callback)
 
-        try:
-            export_link = wait.until(EC.element_to_be_clickable((By.ID, "exportToExcelLink")))
-        except TimeoutException:
-            export_link = driver.find_element(By.XPATH, "//a[contains(text(), 'Excel')]")
+            try:
+                export_link = wait.until(lambda current_driver: visible_export_link(current_driver))
+            except TimeoutException:
+                driver.switch_to.default_content()
+                emit(progress_callback, f"{airport}: export link did not appear", None)
+                return None
 
-        driver.execute_script("arguments[0].scrollIntoView(true);", export_link)
-        time.sleep(0.5)
-        export_link.click()
-        driver.switch_to.default_content()
+            click_time = time.time()
+            driver.execute_script("arguments[0].scrollIntoView(true);", export_link)
+            time.sleep(0.5)
+            driver.execute_script("arguments[0].click();", export_link)
+            driver.switch_to.default_content()
+            emit(progress_callback, f"{airport}: export clicked; waiting for Excel file", None)
 
-        return wait_for_new_download(
-            download_dir,
-            existing_names,
-            click_time,
-            cancel_callback=cancel_callback,
-        )
+            downloaded_file = wait_for_new_download(
+                download_dir,
+                existing_names,
+                click_time,
+                timeout=120,
+                cancel_callback=cancel_callback,
+                progress_callback=progress_callback,
+                airport=airport,
+            )
+            if downloaded_file:
+                return downloaded_file
+
+            if attempt == 1:
+                emit(progress_callback, f"{airport}: no file appeared; retrying export click", None)
+
+        return None
     except Exception:
         logger.exception("Could not export results to Excel")
         try:
@@ -775,27 +945,58 @@ def wait_for_new_download(
     start_time: float,
     timeout: int = 90,
     cancel_callback: CancelCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
+    airport: str | None = None,
 ) -> Path | None:
     deadline = time.time() + timeout
+    start_wait = time.time()
+    last_progress_at = start_wait
+    partial_seen = False
+
     while time.time() < deadline:
         check_cancelled(cancel_callback)
-        partials = list(download_dir.glob("*.crdownload")) + list(download_dir.glob("*.tmp"))
+        partials = (
+            list(download_dir.glob("*.crdownload"))
+            + list(download_dir.glob("*.tmp"))
+            + list(download_dir.glob("*.download"))
+        )
         if partials:
+            partial_seen = True
             time.sleep(1)
             continue
 
         candidates = []
-        for path in download_dir.glob("*.xlsx"):
-            try:
-                is_new_name = path.name not in existing_names
-                is_recent = path.stat().st_mtime >= start_time
-                if is_new_name or is_recent:
-                    candidates.append(path)
-            except FileNotFoundError:
-                continue
+        for suffix in EXPORT_FILE_SUFFIXES:
+            for path in download_dir.glob(f"*{suffix}"):
+                try:
+                    is_new_name = path.name not in existing_names
+                    stat = path.stat()
+                    is_recent = stat.st_mtime >= start_time
+                    has_content = stat.st_size > 0
+                    if (is_new_name or is_recent) and has_content:
+                        candidates.append(path)
+                except FileNotFoundError:
+                    continue
 
         if candidates:
-            return max(candidates, key=lambda item: item.stat().st_mtime)
+            newest = max(candidates, key=lambda item: item.stat().st_mtime)
+            try:
+                first_size = newest.stat().st_size
+                time.sleep(0.75)
+                second_size = newest.stat().st_size
+                if first_size == second_size and second_size > 0:
+                    return newest
+            except FileNotFoundError:
+                pass
+
+        now = time.time()
+        if progress_callback and airport and now - last_progress_at >= 20:
+            elapsed = int(now - start_wait)
+            if partial_seen:
+                emit(progress_callback, f"{airport}: Excel download is still finishing ({elapsed}s)", None)
+            else:
+                emit(progress_callback, f"{airport}: still waiting for Excel file ({elapsed}s)", None)
+            last_progress_at = now
 
         time.sleep(1)
 
@@ -808,7 +1009,8 @@ def merge_excel_files(file_directory: str | Path, output_filename: str = "merged
 
     excel_files = sorted(
         path
-        for path in target_dir.glob("*.xlsx")
+        for suffix in EXPORT_FILE_SUFFIXES
+        for path in target_dir.glob(f"*{suffix}")
         if path.name != output_filename and not path.name.startswith("~$")
     )
     if not excel_files:
@@ -968,35 +1170,64 @@ def run_download_workflow(
             base_progress = 30 + int(((index - 1) / total_airports) * 50)
             emit(progress_callback, f"Processing {airport} ({index}/{total_airports})", base_progress)
 
-            if not set_date_range_and_airport(
-                driver,
-                airport,
-                is_first_airport=index == 1,
-                start_date=icargo_start_date,
-                end_date=icargo_end_date,
-            ):
-                failed_downloads += 1
-                emit(progress_callback, f"{airport}: failed to set query parameters", base_progress)
-                continue
+            downloaded_file = None
+            last_failure = "download did not complete"
 
-            if not execute_tariff_query(driver):
-                failed_downloads += 1
-                emit(progress_callback, f"{airport}: query failed", base_progress)
-                continue
+            for attempt in range(1, 3):
+                check_cancelled(cancel_callback)
+                if index > 1 or attempt > 1:
+                    if attempt > 1:
+                        emit(progress_callback, f"{airport}: retrying from a fresh TRF007 screen ({attempt}/2)", base_progress)
+                    else:
+                        emit(progress_callback, f"{airport}: opening a fresh TRF007 screen", base_progress)
 
-            check_cancelled(cancel_callback)
-            downloaded_file = download_results_as_excel(
-                driver,
-                config.download_dir,
-                cancel_callback=cancel_callback,
-            )
+                    if not navigate_to_screen(driver, "TRF007"):
+                        last_failure = "could not reopen TRF007"
+                        continue
+
+                emit(progress_callback, f"{airport}: setting dates and origin", base_progress + 1)
+                if not set_date_range_and_airport(
+                    driver,
+                    airport,
+                    is_first_airport=True,
+                    start_date=icargo_start_date,
+                    end_date=icargo_end_date,
+                    cancel_callback=cancel_callback,
+                ):
+                    last_failure = "failed to set query parameters"
+                    continue
+
+                emit(progress_callback, f"{airport}: running query", base_progress + 1)
+                if not execute_tariff_query(
+                    driver,
+                    airport,
+                    cancel_callback=cancel_callback,
+                    progress_callback=progress_callback,
+                ):
+                    last_failure = "query failed or returned no export"
+                    continue
+
+                check_cancelled(cancel_callback)
+                emit(progress_callback, f"{airport}: exporting Excel", base_progress + 2)
+                downloaded_file = download_results_as_excel(
+                    driver,
+                    config.download_dir,
+                    airport=airport,
+                    cancel_callback=cancel_callback,
+                    progress_callback=progress_callback,
+                )
+                if downloaded_file:
+                    break
+
+                last_failure = "export failed or timed out"
+
             if not downloaded_file:
                 failed_downloads += 1
-                emit(progress_callback, f"{airport}: export failed or timed out", base_progress)
+                emit(progress_callback, f"{airport}: {last_failure}", base_progress)
                 continue
 
             successful_downloads += 1
-            emit(progress_callback, f"{airport}: downloaded {downloaded_file.name}", base_progress + 2)
+            emit(progress_callback, f"{airport}: downloaded {downloaded_file.name}", base_progress + 3)
             for _ in range(4):
                 check_cancelled(cancel_callback)
                 time.sleep(0.5)
