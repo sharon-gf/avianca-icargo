@@ -75,7 +75,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v11-export-real-click"
+DOWNLOADER_BUILD_VERSION = "job-api-v13-unique-files-no-rows-wait"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
 
@@ -790,10 +790,12 @@ def wait_for_query_results(
 ) -> bool:
     start_time = time.time()
     last_progress_at = start_time
+    no_results_since = None
 
     while time.time() - start_time < timeout:
         check_cancelled(cancel_callback)
         wait_for_icargo_idle(driver, timeout=3, cancel_callback=cancel_callback)
+        now = time.time()
 
         try:
             if visible_export_link(driver):
@@ -806,12 +808,17 @@ def wait_for_query_results(
                 """
             )
             if no_results:
-                emit(progress_callback, f"{airport}: Avianca returned no rows", None)
-                return False
+                if no_results_since is None:
+                    no_results_since = now
+                    emit(progress_callback, f"{airport}: Avianca says no rows; checking again", None)
+                elif now - no_results_since >= 12:
+                    emit(progress_callback, f"{airport}: Avianca returned no rows", None)
+                    return False
+            else:
+                no_results_since = None
         except Exception:
             pass
 
-        now = time.time()
         if now - last_progress_at >= 15:
             elapsed = int(now - start_time)
             emit(progress_callback, f"{airport}: still waiting for Avianca results ({elapsed}s)", None)
@@ -1047,6 +1054,32 @@ def wait_for_new_download(
     return None
 
 
+def airport_export_filename(original_path: Path, airport: str, sequence: int) -> str:
+    airport_code = re.sub(r"[^A-Z0-9]", "", airport.upper())[:8] or "AIRPORT"
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", original_path.stem).strip("._") or "export"
+    suffix = original_path.suffix.lower() if original_path.suffix.lower() in EXPORT_FILE_SUFFIXES else ".xlsx"
+    return f"{sequence:02d}_{airport_code}_{stem}{suffix}"
+
+
+def rename_airport_export(downloaded_file: Path, airport: str, sequence: int) -> Path:
+    target_dir = downloaded_file.parent
+    target_path = target_dir / airport_export_filename(downloaded_file, airport, sequence)
+
+    counter = 2
+    while target_path.exists() and target_path.resolve() != downloaded_file.resolve():
+        target_path = target_dir / (
+            f"{sequence:02d}_{airport.upper()}_{downloaded_file.stem}_{counter}{downloaded_file.suffix}"
+        )
+        counter += 1
+
+    if target_path.resolve() == downloaded_file.resolve():
+        return downloaded_file
+
+    downloaded_file.rename(target_path)
+    logger.info("Renamed export %s to %s", downloaded_file.name, target_path.name)
+    return target_path
+
+
 def merge_excel_files(file_directory: str | Path, output_filename: str = "merged_tariffs.xlsx") -> Path | None:
     target_dir = Path(file_directory)
     output_path = target_dir / output_filename
@@ -1065,6 +1098,9 @@ def merge_excel_files(file_directory: str | Path, output_filename: str = "merged
     for excel_file in excel_files:
         try:
             df = pd.read_excel(excel_file)
+            source_match = re.match(r"^\d{2}_([A-Z0-9]{3,8})_", excel_file.name)
+            if source_match and "Source Airport" not in df.columns:
+                df.insert(0, "Source Airport", source_match.group(1))
             dataframes.append(df)
             logger.info("Loaded %s (%s rows)", excel_file.name, len(df))
         except Exception as exc:
@@ -1270,6 +1306,7 @@ def run_download_workflow(
                 emit(progress_callback, f"{airport}: {last_failure}", base_progress)
                 continue
 
+            downloaded_file = rename_airport_export(downloaded_file, airport, index)
             successful_downloads += 1
             emit(progress_callback, f"{airport}: downloaded {downloaded_file.name}", base_progress + 3)
             for _ in range(4):
