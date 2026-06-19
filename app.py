@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, jsonify, redirect, render_template, request, send_file
 
 DEFAULT_AIRPORTS = [
     "CAN",
@@ -63,7 +63,7 @@ JOBS: dict[str, dict] = {}
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v2-app"
+APP_BUILD_VERSION = "job-api-v4-country-groups-local-time"
 
 
 def now_iso() -> str:
@@ -91,9 +91,11 @@ def add_job_log(job_id: str, message: str, progress: int | None = None) -> None:
         job = JOBS.get(job_id)
         if not job:
             return
+        timestamp = datetime.now(timezone.utc)
         job["logs"].append(
             {
-                "time": datetime.now().strftime("%H:%M:%S"),
+                "time": timestamp.strftime("%H:%M:%S"),
+                "timeUtc": timestamp.isoformat(),
                 "message": message,
             }
         )
@@ -152,7 +154,16 @@ def disable_response_cache(response):
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
+    if request.headers.get("X-Forwarded-Proto", request.scheme).split(",")[0].strip() == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
+
+
+@app.before_request
+def redirect_http_to_https():
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", request.scheme).split(",")[0].strip()
+    if forwarded_proto == "http" and request.host == "icargo.gsaforce.com":
+        return redirect(request.url.replace("http://", "https://", 1), code=301)
 
 
 def load_downloader_function():
