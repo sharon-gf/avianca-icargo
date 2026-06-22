@@ -75,7 +75,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v21-cap142-dom-order-fields"
+DOWNLOADER_BUILD_VERSION = "job-api-v24-cap142-export-retry-debug"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
@@ -881,6 +881,174 @@ def save_cap142_debug_snapshot(driver: webdriver.Chrome, debug_dir: Path | None,
             pass
 
 
+def cap142_ensure_search_form_visible(
+    driver: webdriver.Chrome,
+    *,
+    origin: str,
+    cancel_callback: CancelCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
+    timeout: int = 45,
+) -> bool:
+    deadline = time.time() + timeout
+    clicked_edit = False
+    last_result = None
+
+    while time.time() < deadline:
+        check_cancelled(cancel_callback)
+        enter_cap142_frame(driver, timeout=20)
+        wait_for_icargo_idle(driver, timeout=10, cancel_callback=cancel_callback)
+
+        result = driver.execute_script(
+            """
+            function visible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    Number(style.opacity || 1) > 0 &&
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    !el.disabled;
+            }
+
+            function editableInputs() {
+                const ignoredTypes = new Set([
+                    'button',
+                    'checkbox',
+                    'file',
+                    'hidden',
+                    'image',
+                    'radio',
+                    'reset',
+                    'submit'
+                ]);
+                return Array.from(document.querySelectorAll('input, textarea'))
+                    .filter((el) => visible(el) && !ignoredTypes.has(String(el.type || '').toLowerCase()));
+            }
+
+            const bodyText = document.body.innerText || '';
+            const formVisible = /AWB\\s+Number/i.test(bodyText) &&
+                /Flight\\s+No/i.test(bodyText) &&
+                editableInputs().length >= 9;
+
+            if (formVisible) {
+                return { ok: true, clicked: false, reason: 'search form visible' };
+            }
+
+            function describe(el) {
+                const rect = el.getBoundingClientRect();
+                return [
+                    el.innerText,
+                    el.textContent,
+                    el.value,
+                    el.title,
+                    el.id,
+                    el.name,
+                    el.getAttribute('aria-label'),
+                    el.getAttribute('alt'),
+                    el.getAttribute('src'),
+                    el.className,
+                    el.getAttribute('onclick')
+                ].join(' ');
+            }
+
+            const candidates = Array.from(document.querySelectorAll('button, a, input, img, span, i, div'))
+                .filter(visible)
+                .map((el) => {
+                    const rect = el.getBoundingClientRect();
+                    const text = describe(el);
+                    let score = 0;
+                    if (/edit|pencil|modify|criteria/i.test(text)) score += 50;
+                    if (/excel|export|list|clear|close|print/i.test(text)) score -= 60;
+                    if (rect.top < 220) score += 8;
+                    if (rect.left > window.innerWidth * 0.55) score += 6;
+                    if (rect.width <= 60 && rect.height <= 60) score += 4;
+                    if (window.getComputedStyle(el).cursor === 'pointer') score += 3;
+                    return { el, score, text: text.slice(0, 160), top: rect.top, left: rect.left };
+                })
+                .filter((item) => item.score > 0)
+                .sort((a, b) => b.score - a.score);
+
+            if (candidates.length) {
+                candidates[0].el.click();
+                return {
+                    ok: false,
+                    clicked: true,
+                    method: 'candidate',
+                    score: candidates[0].score,
+                    candidate: candidates[0].text
+                };
+            }
+
+            function clickableAncestor(el) {
+                let current = el;
+                while (current && !['BODY', 'HTML'].includes(current.tagName)) {
+                    const style = window.getComputedStyle(current);
+                    if (
+                        ['A', 'BUTTON', 'INPUT', 'IMG', 'SPAN', 'I', 'DIV'].includes(current.tagName) &&
+                        (style.cursor === 'pointer' || current.onclick || current.getAttribute('onclick') ||
+                            /edit|pencil|modify|criteria/i.test(describe(current)))
+                    ) {
+                        return current;
+                    }
+                    current = current.parentElement;
+                }
+                return el;
+            }
+
+            const pointCandidates = [];
+            for (const xOffset of [12, 24, 36, 52, 72, 96]) {
+                for (const y of [44, 64, 86, 108, 132, 156, 184, 216]) {
+                    pointCandidates.push([window.innerWidth - xOffset, y]);
+                }
+            }
+            for (const [x, y] of pointCandidates) {
+                const stack = document.elementsFromPoint(x, y);
+                const raw = stack.find((item) => visible(item) && !['BODY', 'HTML'].includes(item.tagName));
+                const el = clickableAncestor(raw);
+                if (visible(el) && !['BODY', 'HTML'].includes(el.tagName)) {
+                    el.scrollIntoView({ block: 'center', inline: 'center' });
+                    el.click();
+                    return {
+                        ok: false,
+                        clicked: true,
+                        method: 'top-right-point',
+                        point: `${x},${y}`,
+                        candidate: describe(el).slice(0, 160)
+                    };
+                }
+            }
+
+            return {
+                ok: false,
+                clicked: false,
+                reason: 'search form hidden and edit control was not found',
+                bodyText: bodyText.slice(0, 600)
+            };
+            """
+        )
+
+        driver.switch_to.default_content()
+        last_result = result
+
+        if result and result.get("ok"):
+            return True
+
+        if result and result.get("clicked"):
+            if not clicked_edit:
+                emit(progress_callback, f"{origin}: opening CAP142 search fields", None)
+                clicked_edit = True
+            time.sleep(2)
+            continue
+
+        time.sleep(2)
+
+    logger.error("CAP142 search form could not be reopened: %s", last_result)
+    emit(progress_callback, f"{origin}: CAP142 search form is still hidden", None)
+    return False
+
+
 def cap142_set_search_fields(
     driver: webdriver.Chrome,
     *,
@@ -900,6 +1068,14 @@ def cap142_set_search_fields(
     last_progress_at = 0.0
 
     try:
+        if not cap142_ensure_search_form_visible(
+            driver,
+            origin=origin,
+            cancel_callback=cancel_callback,
+            progress_callback=progress_callback,
+        ):
+            return False
+
         while time.time() < deadline:
             check_cancelled(cancel_callback)
             enter_cap142_frame(driver, timeout=20)
@@ -1379,6 +1555,8 @@ def download_results_as_excel(
     cancel_callback: CancelCallback | None = None,
     progress_callback: ProgressCallback | None = None,
     screen_num: str = "TRF007",
+    download_timeout: int = 60,
+    debug_dir: Path | None = None,
 ) -> Path | None:
     try:
         existing_names = {
@@ -1415,13 +1593,27 @@ def download_results_as_excel(
             download_dir,
             existing_names,
             click_time,
-            timeout=60,
+            timeout=download_timeout,
             cancel_callback=cancel_callback,
             progress_callback=progress_callback,
             airport=airport,
         )
         if downloaded_file:
             return downloaded_file
+
+        if debug_dir:
+            try:
+                enter_screen_frame(driver, screen_num, timeout=10)
+                saved_files = save_debug_snapshot(driver, debug_dir, f"{screen_num}_{airport}_export_timeout")
+                driver.switch_to.default_content()
+                if saved_files:
+                    emit(progress_callback, f"{airport}: saved debug snapshot for export timeout", None)
+            except Exception as exc:
+                logger.info("Could not save export timeout snapshot for %s: %s", airport, exc)
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
 
         return None
     except Exception:
@@ -1735,6 +1927,8 @@ def run_cap142_workflow(
                     cancel_callback=cancel_callback,
                     progress_callback=progress_callback,
                     screen_num="CAP142",
+                    download_timeout=150,
+                    debug_dir=debug_dir,
                 )
                 if downloaded_file:
                     break
