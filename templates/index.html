@@ -59,6 +59,26 @@
             margin-bottom: 22px;
         }
 
+        .conditional-panel {
+            display: none;
+        }
+
+        .conditional-panel.active {
+            display: block;
+        }
+
+        .input-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+
+        .flight-grid {
+            display: grid;
+            grid-template-columns: 76px minmax(0, 1fr);
+            gap: 8px;
+        }
+
         label {
             display: block;
             font-size: 14px;
@@ -67,7 +87,8 @@
         }
 
         select,
-        input[type="date"] {
+        input[type="date"],
+        input[type="text"] {
             width: 100%;
             min-height: 40px;
             border: 1px solid #cbd3df;
@@ -80,7 +101,8 @@
         }
 
         select:focus,
-        input[type="date"]:focus {
+        input[type="date"]:focus,
+        input[type="text"]:focus {
             border-color: #1b66d2;
             box-shadow: 0 0 0 3px rgba(27, 102, 210, 0.14);
             outline: none;
@@ -363,14 +385,19 @@
             .date-grid {
                 grid-template-columns: 1fr;
             }
+
+            .input-grid,
+            .flight-grid {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
 <body>
     <main class="shell">
         <header>
-            <h1>Avianca TRF007 Downloader</h1>
-            <p class="subtitle">Tariff exports for selected origin airports</p>
+            <h1>Avianca iCargo Downloader</h1>
+            <p class="subtitle">TRF007 tariffs and CAP142 booking exports</p>
         </header>
 
         <div class="layout">
@@ -379,11 +406,42 @@
                     <label for="module">Module</label>
                     <select id="module">
                         <option value="TRF007">TRF007 - Tariff/Rate Requests</option>
+                        <option value="CAP142">CAP142 - Booking Data</option>
                     </select>
                 </div>
 
+                <div class="conditional-panel" id="cap142Panel">
+                    <div class="form-group">
+                        <label for="cap142Mode">CAP142 download type</label>
+                        <select id="cap142Mode">
+                            <option value="booking_period">Booking date period</option>
+                            <option value="specific_flight">Specific flight</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group" id="awbPrefixGroup">
+                        <label for="awbPrefix">AWB prefix</label>
+                        <input type="text" id="awbPrefix" value="729" inputmode="numeric">
+                    </div>
+
+                    <div class="form-group conditional-panel" id="flightFields">
+                        <label>Flight number</label>
+                        <div class="flight-grid">
+                            <input type="text" id="flightCarrier" value="QT" maxlength="2">
+                            <input type="text" id="flightNumber" inputmode="numeric" placeholder="4043">
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="originType">Origin type</label>
+                        <select id="originType">
+                            <option value="Airport">Airport</option>
+                        </select>
+                    </div>
+                </div>
+
                 <div class="form-group">
-                    <label>Airports</label>
+                    <label id="originsLabel">Airports</label>
                     <div class="button-row">
                         <button type="button" id="selectAllBtn">Select all</button>
                         <button type="button" id="clearBtn">Clear</button>
@@ -393,14 +451,14 @@
                 </div>
 
                 <div class="form-group">
-                    <label>Date range</label>
+                    <label id="dateRangeLabel">Date range</label>
                     <div class="date-grid">
                         <div>
-                            <div class="field-caption">From</div>
+                            <div class="field-caption" id="startDateCaption">From</div>
                             <input type="date" id="startDate">
                         </div>
                         <div>
-                            <div class="field-caption">To</div>
+                            <div class="field-caption" id="endDateCaption">To</div>
                             <input type="date" id="endDate">
                         </div>
                     </div>
@@ -477,6 +535,11 @@
             endInput.min = startInput.value;
             endInput.max = toInputDate(addDays(startDate, MAX_RANGE_DAYS));
 
+            if (currentModule() === "CAP142" && currentCap142Mode() === "specific_flight") {
+                endInput.value = startInput.value;
+                return;
+            }
+
             if (endInput.value < endInput.min || endInput.value > endInput.max) {
                 endInput.value = endInput.max;
             }
@@ -550,6 +613,33 @@
             return Array.from(document.querySelectorAll(".airport-checkbox:checked")).map((checkbox) => checkbox.value);
         }
 
+        function currentModule() {
+            return document.getElementById("module").value;
+        }
+
+        function currentCap142Mode() {
+            return document.getElementById("cap142Mode").value;
+        }
+
+        function updateModuleView() {
+            const module = currentModule();
+            const cap142Mode = currentCap142Mode();
+            const isCap142 = module === "CAP142";
+            const isSpecificFlight = isCap142 && cap142Mode === "specific_flight";
+
+            document.getElementById("cap142Panel").classList.toggle("active", isCap142);
+            document.getElementById("flightFields").classList.toggle("active", isSpecificFlight);
+            document.getElementById("awbPrefixGroup").style.display = isCap142 ? "block" : "none";
+            document.getElementById("originsLabel").textContent = isCap142 ? "Origins" : "Airports";
+            document.getElementById("dateRangeLabel").textContent = isSpecificFlight ? "Flight date" : (isCap142 ? "Booking date range" : "Date range");
+            document.getElementById("startDateCaption").textContent = isSpecificFlight ? "Flight date from" : "From";
+            document.getElementById("endDateCaption").textContent = isSpecificFlight ? "Flight date to" : "To";
+
+            if (isSpecificFlight) {
+                document.getElementById("endDate").value = document.getElementById("startDate").value;
+            }
+        }
+
         function setBusy(isBusy) {
             document.getElementById("downloadBtn").disabled = isBusy;
             document.querySelectorAll("input, select, #selectAllBtn, #clearBtn").forEach((element) => {
@@ -576,16 +666,36 @@
             }
 
             const airports = selectedAirports();
+            const module = currentModule();
             const payload = {
-                module: document.getElementById("module").value,
+                module,
                 airports,
                 startDate: document.getElementById("startDate").value,
                 endDate: document.getElementById("endDate").value
             };
 
             if (!airports.length) {
-                showStatus("Select at least one airport.", "error");
+                showStatus("Select at least one origin.", "error");
                 return;
+            }
+
+            if (module === "CAP142") {
+                payload.cap142Mode = currentCap142Mode();
+                payload.awbPrefix = document.getElementById("awbPrefix").value;
+                payload.flightCarrier = document.getElementById("flightCarrier").value;
+                payload.flightNumber = document.getElementById("flightNumber").value;
+                payload.originType = document.getElementById("originType").value;
+
+                if (payload.cap142Mode === "specific_flight") {
+                    if (airports.length !== 1) {
+                        showStatus("Specific flight mode needs exactly one origin.", "error");
+                        return;
+                    }
+                    if (!payload.flightNumber.trim()) {
+                        showStatus("Enter a flight number.", "error");
+                        return;
+                    }
+                }
             }
 
             setBusy(true);
@@ -719,10 +829,11 @@
 
         function renderJob(job) {
             const progress = job.progress || 0;
+            const unit = job.module === "CAP142" ? "origins" : "airports";
             document.getElementById("jobBadge").textContent = job.status;
             document.getElementById("progressFill").style.width = `${progress}%`;
             document.getElementById("jobMeta").textContent =
-                `${job.airports.length} airports | ${job.startDate} to ${job.endDate} | ${progress}%`;
+                `${job.airports.length} ${unit} | ${job.startDate} to ${job.endDate} | ${progress}%`;
 
             if (job.status === "completed" && job.downloadUrl) {
                 document.getElementById("jobActions").innerHTML =
@@ -793,10 +904,13 @@
         });
 
         document.getElementById("startDate").addEventListener("change", syncDateLimits);
+        document.getElementById("module").addEventListener("change", updateModuleView);
+        document.getElementById("cap142Mode").addEventListener("change", updateModuleView);
         document.getElementById("downloadBtn").addEventListener("click", startDownload);
 
         initDates();
         initAirports();
+        updateModuleView();
         if (window.location.protocol === "file:") {
             showStatus("This is the raw HTML file. Open the Railway URL to run downloads.", "error");
             document.getElementById("downloadBtn").disabled = true;
