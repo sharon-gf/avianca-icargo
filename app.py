@@ -64,7 +64,7 @@ JOBS: dict[str, dict] = {}
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v9-cap142-diagnostic-mode"
+APP_BUILD_VERSION = "job-api-v10-cap142-dom-order-fields"
 
 
 def now_iso() -> str:

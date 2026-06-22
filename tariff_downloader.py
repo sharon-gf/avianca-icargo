@@ -75,7 +75,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v20-cap142-diagnostic-mode"
+DOWNLOADER_BUILD_VERSION = "job-api-v21-cap142-dom-order-fields"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
@@ -920,13 +920,6 @@ def cap142_set_search_fields(
                         rect.height > 0;
                 }
 
-                function sortByPosition(a, b) {
-                    const ar = a.getBoundingClientRect();
-                    const br = b.getBoundingClientRect();
-                    if (Math.abs(ar.top - br.top) > 10) return ar.top - br.top;
-                    return ar.left - br.left;
-                }
-
                 function editableInputs() {
                     const ignoredTypes = new Set([
                         'button',
@@ -939,14 +932,12 @@ def cap142_set_search_fields(
                         'submit'
                     ]);
                     return Array.from(document.querySelectorAll('input, textarea'))
-                        .filter((el) => visible(el) && !ignoredTypes.has(String(el.type || '').toLowerCase()))
-                        .sort(sortByPosition);
+                        .filter((el) => visible(el) && !ignoredTypes.has(String(el.type || '').toLowerCase()));
                 }
 
                 function visibleSelects() {
                     return Array.from(document.querySelectorAll('select'))
-                        .filter(visible)
-                        .sort(sortByPosition);
+                        .filter(visible);
                 }
 
                 function setInput(el, value) {
