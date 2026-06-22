@@ -75,7 +75,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v24-cap142-export-retry-debug"
+DOWNLOADER_BUILD_VERSION = "job-api-v25-login-wait-debug"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
@@ -585,10 +585,25 @@ def login_to_avianca(
         except TimeoutException:
             pass
 
-        time.sleep(6)
-        if "showMainPage" not in driver.current_url and "icargo" not in driver.current_url:
-            logger.error("Login may have failed. Current URL: %s", driver.current_url)
-            emit(progress_callback, f"Login redirect did not reach iCargo: {driver.current_url}", 16)
+        login_deadline = time.time() + 45
+        reached_icargo = False
+        last_url = driver.current_url
+        while time.time() < login_deadline:
+            check_cancelled(cancel_callback)
+            for window_handle in driver.window_handles:
+                driver.switch_to.window(window_handle)
+                current_url = driver.current_url
+                last_url = current_url
+                if "showMainPage" in current_url or ("icargo" in current_url and "login.do" not in current_url):
+                    reached_icargo = True
+                    break
+            if reached_icargo:
+                break
+            time.sleep(2)
+
+        if not reached_icargo:
+            logger.error("Login may have failed. Current URL: %s", last_url)
+            emit(progress_callback, f"Login redirect did not reach iCargo: {last_url}", 16)
             return False
 
         all_windows = driver.window_handles
@@ -1853,8 +1868,9 @@ def run_cap142_workflow(
             config=config,
             progress_callback=progress_callback,
             cancel_callback=cancel_callback,
-            max_attempts=2,
+            max_attempts=3,
             screen_num="CAP142",
+            debug_dir=debug_dir,
         )
 
         total_origins = len(selected_origins)
@@ -2013,6 +2029,7 @@ def prepare_icargo_session(
     cancel_callback: CancelCallback | None,
     max_attempts: int = 2,
     screen_num: str = "TRF007",
+    debug_dir: Path | None = None,
 ) -> webdriver.Chrome:
     last_error = None
 
@@ -2057,6 +2074,9 @@ def prepare_icargo_session(
             logger.exception("Avianca setup attempt %s/%s failed", attempt, max_attempts)
             emit(progress_callback, f"Avianca setup attempt {attempt}/{max_attempts} failed: {exc}", 7)
             if driver:
+                saved_files = save_debug_snapshot(driver, debug_dir, f"avianca_setup_attempt_{attempt}_failed")
+                if saved_files:
+                    emit(progress_callback, f"Saved debug snapshot for Avianca setup attempt {attempt}", 7)
                 try:
                     driver.quit()
                 except Exception:
@@ -2116,6 +2136,7 @@ def run_download_workflow(
     selected_airports = normalize_airports(airports)
     icargo_start_date, icargo_end_date = validate_date_range(start_date, end_date)
     config.download_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir = config.download_dir.parent / "debug"
 
     file_handler = add_file_logger(config.log_dir)
     driver = None
@@ -2132,7 +2153,8 @@ def run_download_workflow(
             config=config,
             progress_callback=progress_callback,
             cancel_callback=cancel_callback,
-            max_attempts=2,
+            max_attempts=3,
+            debug_dir=debug_dir,
         )
 
         total_airports = len(selected_airports)

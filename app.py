@@ -64,7 +64,7 @@ JOBS: dict[str, dict] = {}
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v13-cap142-export-retry-debug"
+APP_BUILD_VERSION = "job-api-v14-login-wait-debug"
 
 
 def now_iso() -> str:
