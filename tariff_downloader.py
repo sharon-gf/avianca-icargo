@@ -75,7 +75,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v17-cap142-field-detection"
+DOWNLOADER_BUILD_VERSION = "job-api-v18-cap142-clear-flight"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
@@ -966,7 +966,7 @@ def cap142_set_search_fields(
                     setInput(textControls[6], '');
                     setInput(textControls[7], '');
                 } else {
-                    setInput(textControls[2], values.flightCarrier || 'QT');
+                    setInput(textControls[2], '');
                     setInput(textControls[3], '');
                     setInput(textControls[4], '');
                     setInput(textControls[5], '');
@@ -1008,6 +1008,19 @@ def cap142_set_search_fields(
             driver.switch_to.default_content()
             last_result = result
             if result and result.get("ok"):
+                if progress_callback:
+                    if mode == "specific_flight":
+                        emit(
+                            progress_callback,
+                            f"{origin}: CAP142 fields entered (flight {flight_carrier}{flight_number}, dates {start_date} to {end_date}, origin {origin})",
+                            None,
+                        )
+                    else:
+                        emit(
+                            progress_callback,
+                            f"{origin}: CAP142 fields entered (AWB {awb_prefix}, flight blank, booking {start_date} to {end_date}, origin {origin})",
+                            None,
+                        )
                 time.sleep(1)
                 return True
 
@@ -1510,7 +1523,11 @@ def run_cap142_workflow(
         raise ValueError("CAP142 country-origin automation is not enabled yet. Use Airport for now.")
 
     awb_prefix = re.sub(r"\D", "", awb_prefix or "729") or "729"
-    flight_carrier = (flight_carrier or "QT").strip().upper()
+    if mode == "specific_flight":
+        flight_carrier = (flight_carrier or "QT").strip().upper()
+    else:
+        flight_carrier = ""
+        flight_number = ""
     flight_number = (flight_number or "").strip()
     if mode == "specific_flight" and not flight_number:
         raise ValueError("Flight number is required for CAP142 specific flight")
