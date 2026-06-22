@@ -64,7 +64,7 @@ JOBS: dict[str, dict] = {}
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v7-cap142-clear-flight"
+APP_BUILD_VERSION = "job-api-v9-cap142-diagnostic-mode"
 
 
 def now_iso() -> str:
@@ -121,11 +121,30 @@ def public_job(job: dict) -> dict:
         "endDate": job["end_date"],
         "error": job.get("error"),
         "result": job.get("result"),
+        "debugFiles": public_debug_files(job),
         "cancelRequested": bool(job.get("cancel_requested")),
     }
     if job["status"] == "completed":
         response["downloadUrl"] = f"/api/jobs/{job['id']}/file"
     return response
+
+
+def public_debug_files(job: dict) -> list[dict]:
+    debug_dir = Path(job["work_dir"]) / "debug"
+    if not debug_dir.exists():
+        return []
+
+    files = []
+    for path in sorted(debug_dir.iterdir(), key=lambda item: item.stat().st_mtime):
+        if not path.is_file() or path.suffix.lower() not in {".png", ".html"}:
+            continue
+        files.append(
+            {
+                "name": path.name,
+                "url": f"/api/jobs/{job['id']}/debug/{path.name}",
+            }
+        )
+    return files[-10:]
 
 
 def find_active_job_locked() -> dict | None:
@@ -413,6 +432,7 @@ def start_download():
                 "flight_number": flight_number,
                 "awb_prefix": awb_prefix,
                 "origin_type": "Airport",
+                "cap142_debug": bool(data.get("cap142Debug")),
             }
 
         start = parse_iso_date(start_date, "startDate")
@@ -535,6 +555,21 @@ def download_job_file(job_id: str):
         download_name=filename,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+
+@app.route("/api/jobs/<job_id>/debug/<filename>")
+def download_debug_file(job_id: str, filename: str):
+    with JOB_LOCK:
+        job = JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        debug_dir = (Path(job["work_dir"]) / "debug").resolve()
+
+    file_path = (debug_dir / filename).resolve()
+    if file_path.parent != debug_dir or not file_path.exists() or file_path.suffix.lower() not in {".png", ".html"}:
+        return jsonify({"error": "Debug file not found"}), 404
+
+    return send_file(str(file_path), as_attachment=False)
 
 
 @app.errorhandler(404)

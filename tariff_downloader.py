@@ -75,7 +75,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v18-cap142-clear-flight"
+DOWNLOADER_BUILD_VERSION = "job-api-v20-cap142-diagnostic-mode"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
@@ -192,6 +192,10 @@ def format_icargo_date(value: str | date) -> str:
         except ValueError:
             parsed = datetime.strptime(value.upper(), "%d-%b-%Y").date()
     return parsed.strftime("%d-%b-%Y").upper()
+
+
+def format_cap142_date(value: str) -> str:
+    return datetime.strptime(value.upper(), "%d-%b-%Y").strftime("%d-%b-%Y")
 
 
 def validate_date_range(start_date: str | date | None, end_date: str | date | None) -> tuple[str, str]:
@@ -795,6 +799,88 @@ def click_export_link(driver: webdriver.Chrome, export_link) -> str:
     return "javascript click"
 
 
+def cap142_field_summary(result: dict | None, mode: str) -> str:
+    if not result:
+        return "field snapshot unavailable"
+
+    controls = result.get("textControls") or []
+    selects = result.get("selects") or []
+
+    def field_value(index: int) -> str:
+        if index >= len(controls):
+            return "?"
+        value = str(controls[index].get("value") or "").strip()
+        return value or "blank"
+
+    def select_value(index: int) -> str:
+        if index >= len(selects):
+            return "?"
+        value = str(selects[index].get("selectedText") or selects[index].get("value") or "").strip()
+        return value or "blank"
+
+    if mode == "specific_flight":
+        return (
+            f"AWB {field_value(0)}-{field_value(1)}; "
+            f"flight {field_value(2)} {field_value(3)}; "
+            f"flight dates {field_value(4)} to {field_value(5)}; "
+            f"booking dates {field_value(6)} to {field_value(7)}; "
+            f"origin type {select_value(0)}; origin {field_value(8)}"
+        )
+
+    return (
+        f"AWB {field_value(0)}-{field_value(1)}; "
+        f"flight {field_value(2)} {field_value(3)}; "
+        f"flight dates {field_value(4)} to {field_value(5)}; "
+        f"booking dates {field_value(6)} to {field_value(7)}; "
+        f"origin type {select_value(0)}; origin {field_value(8)}; "
+        f"via {field_value(9)}; destination type {select_value(1)}; destination {field_value(10)}"
+    )
+
+
+def safe_debug_label(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")[:80] or "debug"
+
+
+def save_debug_snapshot(driver: webdriver.Chrome, debug_dir: Path | None, label: str) -> list[Path]:
+    if not debug_dir:
+        return []
+
+    try:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_label = safe_debug_label(label)
+        screenshot_path = debug_dir / f"{timestamp}_{safe_label}.png"
+        html_path = debug_dir / f"{timestamp}_{safe_label}.html"
+
+        saved_files = []
+        if driver.save_screenshot(str(screenshot_path)):
+            saved_files.append(screenshot_path)
+
+        try:
+            html = driver.execute_script("return document.documentElement.outerHTML;")
+            if html:
+                html_path.write_text(str(html), encoding="utf-8", errors="ignore")
+                saved_files.append(html_path)
+        except Exception as exc:
+            logger.info("Could not save debug HTML snapshot: %s", exc)
+
+        return saved_files
+    except Exception as exc:
+        logger.warning("Could not save debug snapshot: %s", exc)
+        return []
+
+
+def save_cap142_debug_snapshot(driver: webdriver.Chrome, debug_dir: Path | None, label: str) -> list[Path]:
+    try:
+        enter_cap142_frame(driver, timeout=10)
+        return save_debug_snapshot(driver, debug_dir, label)
+    finally:
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+
+
 def cap142_set_search_fields(
     driver: webdriver.Chrome,
     *,
@@ -880,6 +966,8 @@ def cap142_set_search_fields(
                     }
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'Tab' }));
+                    el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'Tab' }));
                     el.dispatchEvent(new Event('blur', { bubbles: true }));
                     return true;
                 }
@@ -910,6 +998,7 @@ def cap142_set_search_fields(
                         id: el.id || '',
                         name: el.name || '',
                         title: el.title || '',
+                        selectedText: el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex].textContent.trim() : '',
                         value: el.value || '',
                         top: Math.round(rect.top),
                         left: Math.round(rect.left)
@@ -1009,6 +1098,7 @@ def cap142_set_search_fields(
             last_result = result
             if result and result.get("ok"):
                 if progress_callback:
+                    emit(progress_callback, f"{origin}: CAP142 actual fields: {cap142_field_summary(result, mode)}", None)
                     if mode == "specific_flight":
                         emit(
                             progress_callback,
@@ -1056,6 +1146,7 @@ def cap142_click_list(
     origin: str,
     cancel_callback: CancelCallback | None = None,
     progress_callback: ProgressCallback | None = None,
+    debug_dir: Path | None = None,
 ) -> bool:
     try:
         check_cancelled(cancel_callback)
@@ -1104,6 +1195,9 @@ def cap142_click_list(
             timeout=120,
             cancel_callback=cancel_callback,
             progress_callback=progress_callback,
+            no_results_confirm_seconds=45,
+            debug_dir=debug_dir,
+            debug_label=f"CAP142_{origin}_no_rows",
         ):
             driver.switch_to.default_content()
             return False
@@ -1126,6 +1220,9 @@ def wait_for_query_results(
     timeout: int = 90,
     cancel_callback: CancelCallback | None = None,
     progress_callback: ProgressCallback | None = None,
+    no_results_confirm_seconds: int = 12,
+    debug_dir: Path | None = None,
+    debug_label: str | None = None,
 ) -> bool:
     start_time = time.time()
     last_progress_at = start_time
@@ -1149,8 +1246,19 @@ def wait_for_query_results(
             if no_results:
                 if no_results_since is None:
                     no_results_since = now
-                    emit(progress_callback, f"{airport}: Avianca says no rows; checking again", None)
-                elif now - no_results_since >= 12:
+                    emit(
+                        progress_callback,
+                        f"{airport}: Avianca says no rows; checking again for {no_results_confirm_seconds}s",
+                        None,
+                    )
+                elif now - no_results_since >= no_results_confirm_seconds:
+                    saved_files = save_debug_snapshot(
+                        driver,
+                        debug_dir,
+                        debug_label or f"{airport}_no_rows",
+                    )
+                    if saved_files:
+                        emit(progress_callback, f"{airport}: saved debug snapshot for no-row result", None)
                     emit(progress_callback, f"{airport}: Avianca returned no rows", None)
                     return False
             else:
@@ -1507,6 +1615,7 @@ def run_cap142_workflow(
     flight_number: str | None = None,
     awb_prefix: str = "729",
     origin_type: str = "Airport",
+    cap142_debug: bool = False,
 ) -> dict:
     config = DownloaderConfig.from_env(download_dir=download_dir)
     config.validate()
@@ -1533,7 +1642,10 @@ def run_cap142_workflow(
         raise ValueError("Flight number is required for CAP142 specific flight")
 
     icargo_start_date, icargo_end_date = validate_date_range(start_date, end_date)
+    icargo_start_date = format_cap142_date(icargo_start_date)
+    icargo_end_date = format_cap142_date(icargo_end_date)
     config.download_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir = config.download_dir.parent / "debug"
 
     file_handler = add_file_logger(config.log_dir)
     driver = None
@@ -1551,6 +1663,8 @@ def run_cap142_workflow(
             emit(progress_callback, f"Mode: booking period for AWB prefix {awb_prefix}", 4)
             emit(progress_callback, f"Booking date range: {icargo_start_date} to {icargo_end_date}", 5)
         emit(progress_callback, f"Origins selected: {', '.join(selected_origins)}", 6)
+        if cap142_debug:
+            emit(progress_callback, "CAP142 diagnostic mode: will stop after saving a screenshot", 7)
 
         driver = prepare_icargo_session(
             config=config,
@@ -1599,12 +1713,25 @@ def run_cap142_workflow(
                     last_failure = "failed to set CAP142 search fields"
                     continue
 
+                if cap142_debug:
+                    saved_files = save_cap142_debug_snapshot(
+                        driver,
+                        debug_dir,
+                        f"CAP142_{origin}_after_fields",
+                    )
+                    if saved_files:
+                        emit(progress_callback, f"{origin}: diagnostic snapshot saved", base_progress + 2)
+                    else:
+                        emit(progress_callback, f"{origin}: diagnostic snapshot could not be saved", base_progress + 2)
+                    raise RuntimeError("CAP142 diagnostic snapshot saved. No download was attempted.")
+
                 emit(progress_callback, f"{origin}: running CAP142 query", base_progress + 1)
                 if not cap142_click_list(
                     driver,
                     origin,
                     cancel_callback=cancel_callback,
                     progress_callback=progress_callback,
+                    debug_dir=debug_dir,
                 ):
                     last_failure = "CAP142 query failed or returned no export"
                     continue
@@ -1775,6 +1902,7 @@ def run_download_workflow(
     flight_number: str | None = None,
     awb_prefix: str = "729",
     origin_type: str = "Airport",
+    cap142_debug: bool = False,
 ) -> dict:
     module_code = (module or "TRF007").strip().upper()
     if module_code == "CAP142":
@@ -1792,6 +1920,7 @@ def run_download_workflow(
             flight_number=flight_number,
             awb_prefix=awb_prefix,
             origin_type=origin_type,
+            cap142_debug=cap142_debug,
         )
     if module_code != "TRF007":
         raise ValueError(f"Unsupported module: {module}")
