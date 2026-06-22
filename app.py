@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 import importlib
+import re
 import shutil
 import tempfile
 import threading
@@ -63,7 +64,7 @@ JOBS: dict[str, dict] = {}
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v4-country-groups-local-time"
+APP_BUILD_VERSION = "job-api-v5-cap142-ui"
 
 
 def now_iso() -> str:
@@ -113,6 +114,8 @@ def public_job(job: dict) -> dict:
         "logs": job["logs"],
         "createdAt": job["created_at"],
         "updatedAt": job["updated_at"],
+        "module": job.get("module", "TRF007"),
+        "cap142Options": job.get("cap142_options") or {},
         "airports": job["airports"],
         "startDate": job["start_date"],
         "endDate": job["end_date"],
@@ -201,6 +204,8 @@ def run_job(job_id: str) -> None:
         airports = list(job["airports"])
         start_date = job["start_date"]
         end_date = job["end_date"]
+        module = job.get("module", "TRF007")
+        cap142_options = dict(job.get("cap142_options") or {})
         download_dir = Path(job["download_dir"])
         cancel_event = job["cancel_event"]
 
@@ -218,6 +223,8 @@ def run_job(job_id: str) -> None:
             send_email=env_flag("SEND_NOTIFICATION_EMAIL"),
             progress_callback=lambda message, progress=None: add_job_log(job_id, message, progress),
             cancel_callback=cancel_event.is_set,
+            module=module,
+            **cap142_options,
         )
 
         with JOB_LOCK:
@@ -233,6 +240,7 @@ def run_job(job_id: str) -> None:
                 "successfulDownloads": result["successful_downloads"],
                 "failedDownloads": result["failed_downloads"],
                 "fileName": Path(result["merged_file"]).name,
+                "module": result.get("module", module),
             }
             job["file_path"] = result["merged_file"]
             job["updated_at"] = now_iso()
@@ -361,20 +369,47 @@ def start_download():
                 426,
             )
 
-        module = data.get("module", "TRF007")
+        module = str(data.get("module", "TRF007")).strip().upper()
         airports = [str(code).strip().upper() for code in data.get("airports", []) if str(code).strip()]
         start_date = data.get("startDate")
         end_date = data.get("endDate")
+        cap142_options = {}
 
-        if module != "TRF007":
-            return jsonify({"error": "Only TRF007 is currently supported"}), 400
+        if module not in {"TRF007", "CAP142"}:
+            return jsonify({"error": "Only TRF007 and CAP142 are currently supported"}), 400
         if not airports:
-            return jsonify({"error": "No airports selected"}), 400
+            return jsonify({"error": "No origins selected"}), 400
 
         allowed_airports = set(DEFAULT_AIRPORTS)
         invalid_airports = sorted(set(airports) - allowed_airports)
         if invalid_airports:
             return jsonify({"error": f"Invalid airports: {', '.join(invalid_airports)}"}), 400
+
+        if module == "CAP142":
+            cap142_mode = str(data.get("cap142Mode", "booking_period")).strip().lower()
+            if cap142_mode not in {"specific_flight", "booking_period"}:
+                return jsonify({"error": "CAP142 mode must be booking_period or specific_flight"}), 400
+
+            awb_prefix = re.sub(r"\D", "", str(data.get("awbPrefix", "729"))) or "729"
+            flight_carrier = str(data.get("flightCarrier", "QT")).strip().upper() or "QT"
+            flight_number = re.sub(r"\D", "", str(data.get("flightNumber", "")))
+            origin_type = str(data.get("originType", "Airport")).strip() or "Airport"
+
+            if origin_type.lower() != "airport":
+                return jsonify({"error": "CAP142 country origin is not automated yet. Please use Airport."}), 400
+            if cap142_mode == "specific_flight":
+                if len(airports) != 1:
+                    return jsonify({"error": "Specific flight mode needs exactly one origin airport"}), 400
+                if not flight_number:
+                    return jsonify({"error": "Flight number is required for CAP142 specific flight"}), 400
+
+            cap142_options = {
+                "cap142_mode": cap142_mode,
+                "flight_carrier": flight_carrier,
+                "flight_number": flight_number,
+                "awb_prefix": awb_prefix,
+                "origin_type": "Airport",
+            }
 
         start = parse_iso_date(start_date, "startDate")
         end = parse_iso_date(end_date, "endDate")
@@ -411,6 +446,8 @@ def start_download():
                 "created_at": now_iso(),
                 "updated_at": now_iso(),
                 "airports": airports,
+                "module": module,
+                "cap142_options": cap142_options,
                 "start_date": start_date,
                 "end_date": end_date,
                 "work_dir": str(work_dir),
@@ -478,8 +515,10 @@ def download_job_file(job_id: str):
         if job["status"] != "completed":
             return jsonify({"error": "Job is not complete yet"}), 409
         file_path = Path(job["file_path"])
+        module = job.get("module", "TRF007")
+        unit = "origins" if module == "CAP142" else "airports"
         filename = (
-            f"TRF007_{job['result']['successfulDownloads']}airports_"
+            f"{module}_{job['result']['successfulDownloads']}{unit}_"
             f"{job['start_date']}_to_{job['end_date']}.xlsx"
         )
 
