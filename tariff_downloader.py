@@ -75,11 +75,24 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v25-login-wait-debug"
+DOWNLOADER_BUILD_VERSION = "job-api-v26-cap142-processed-tab"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
 VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
+CAP142_PROCESSED_COLUMNS = [
+    ("AWB No.", "AWB No."),
+    ("Shipment Details", "Shipment Details"),
+    ("Flight Details", "Flight Details"),
+    ("Origin", "Origin"),
+    ("Destination", "Destination"),
+    ("Booking Status", "Booking Status"),
+    ("Shipping Date", "Shipping Date"),
+    ("Booking Date", "Booking Date"),
+    ("Reason Code", "Reason Code"),
+    ("Shipment Status", "Shipment Status"),
+    ("Chargeable Weight", "Chargeable Weight"),
+]
 
 ProgressCallback = Callable[[str, int | None], None]
 CancelCallback = Callable[[], bool]
@@ -1777,6 +1790,77 @@ def merge_excel_files(
     return output_path
 
 
+def source_from_export_filename(file_path: str | Path) -> str | None:
+    match = re.match(r"^\d{2}_([A-Z0-9]{3,8})_", Path(file_path).name)
+    if match:
+        return match.group(1)
+    return None
+
+
+def build_cap142_processed_dataframe(
+    raw_df: pd.DataFrame,
+    awb_prefix: str = "729",
+) -> pd.DataFrame:
+    missing_columns = [raw_name for raw_name, _ in CAP142_PROCESSED_COLUMNS if raw_name not in raw_df.columns]
+    if missing_columns:
+        raise RuntimeError("CAP142 raw export is missing columns: " + ", ".join(missing_columns))
+
+    processed_df = pd.DataFrame()
+    for raw_name, output_name in CAP142_PROCESSED_COLUMNS:
+        processed_df[output_name] = raw_df[raw_name].ffill()
+
+    if "Source Origin" in raw_df.columns:
+        source_origin = raw_df["Source Origin"].ffill()
+    else:
+        source_origin = pd.Series([""] * len(raw_df), index=raw_df.index)
+
+    source_origin = source_origin.fillna("").astype(str).str.strip()
+    processed_df["PAIS"] = source_origin.apply(lambda value: f"{awb_prefix} {value}".strip())
+    return processed_df
+
+
+def write_cap142_workbook_with_processed_tab(
+    file_path: str | Path,
+    awb_prefix: str = "729",
+    default_origin: str | None = None,
+) -> Path:
+    workbook_path = Path(file_path)
+    output_path = workbook_path if workbook_path.suffix.lower() == ".xlsx" else workbook_path.with_suffix(".xlsx")
+    raw_df = pd.read_excel(workbook_path, sheet_name=0)
+
+    if "Source Origin" not in raw_df.columns:
+        inferred_origin = default_origin or source_from_export_filename(workbook_path) or ""
+        raw_df.insert(0, "Source Origin", inferred_origin)
+    else:
+        raw_df["Source Origin"] = raw_df["Source Origin"].ffill()
+
+    processed_df = build_cap142_processed_dataframe(raw_df, awb_prefix=awb_prefix)
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        raw_df.to_excel(writer, index=False, sheet_name="Raw Data")
+        processed_df.to_excel(writer, index=False, sheet_name="Processed")
+
+        for sheet_name in ("Raw Data", "Processed"):
+            worksheet = writer.sheets[sheet_name]
+            worksheet.freeze_panes = "A2"
+            for column_cells in worksheet.columns:
+                header = column_cells[0].value
+                max_length = len(str(header or ""))
+                for cell in column_cells[1:200]:
+                    if cell.value is not None:
+                        max_length = max(max_length, len(str(cell.value)))
+                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, 12), 45)
+
+    if output_path != workbook_path:
+        try:
+            workbook_path.unlink()
+        except Exception as exc:
+            logger.warning("Could not delete original CAP142 export %s: %s", workbook_path, exc)
+
+    logger.info("Added CAP142 Processed tab to %s", output_path)
+    return output_path
+
+
 def upload_to_dropbox(config: DownloaderConfig, file_path: str | Path) -> bool:
     if not DROPBOX_AVAILABLE:
         logger.warning("Dropbox SDK is not installed; skipping upload")
@@ -1986,6 +2070,13 @@ def run_cap142_workflow(
             )
             if not merged_file:
                 raise RuntimeError("CAP142 downloaded files could not be merged")
+
+        emit(progress_callback, "Adding CAP142 processed tab", 88)
+        merged_file = write_cap142_workbook_with_processed_tab(
+            merged_file,
+            awb_prefix=awb_prefix,
+            default_origin=selected_origins[0] if len(selected_origins) == 1 else None,
+        )
 
         if upload_dropbox:
             emit(progress_callback, "Uploading CAP142 file to Dropbox", 92)
