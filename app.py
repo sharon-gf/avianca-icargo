@@ -64,7 +64,7 @@ JOBS: dict[str, dict] = {}
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v6-cap142-field-detection"
+APP_BUILD_VERSION = "job-api-v7-cap142-clear-flight"
 
 
 def now_iso() -> str:
@@ -391,8 +391,12 @@ def start_download():
                 return jsonify({"error": "CAP142 mode must be booking_period or specific_flight"}), 400
 
             awb_prefix = re.sub(r"\D", "", str(data.get("awbPrefix", "729"))) or "729"
-            flight_carrier = str(data.get("flightCarrier", "QT")).strip().upper() or "QT"
-            flight_number = re.sub(r"\D", "", str(data.get("flightNumber", "")))
+            if cap142_mode == "specific_flight":
+                flight_carrier = str(data.get("flightCarrier", "QT")).strip().upper() or "QT"
+                flight_number = re.sub(r"\D", "", str(data.get("flightNumber", "")))
+            else:
+                flight_carrier = ""
+                flight_number = ""
             origin_type = str(data.get("originType", "Airport")).strip() or "Airport"
 
             if origin_type.lower() != "airport":
