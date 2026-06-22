@@ -79,6 +79,23 @@
             gap: 8px;
         }
 
+        .checkbox-option {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            color: #303c50;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 650;
+            margin: 0;
+        }
+
+        .checkbox-option input {
+            width: 15px;
+            height: 15px;
+            accent-color: #b4172a;
+        }
+
         label {
             display: block;
             font-size: 14px;
@@ -173,6 +190,24 @@
 
         .danger-btn:hover:not(:disabled) {
             background: #fff0f1;
+        }
+
+        .debug-links {
+            display: grid;
+            gap: 6px;
+            margin-bottom: 12px;
+        }
+
+        .debug-link {
+            color: #1b66d2;
+            font-size: 12px;
+            font-weight: 650;
+            line-height: 1.35;
+            text-decoration: none;
+        }
+
+        .debug-link:hover {
+            text-decoration: underline;
         }
 
         .airports-grid {
@@ -438,6 +473,13 @@
                             <option value="Airport">Airport</option>
                         </select>
                     </div>
+
+                    <div class="form-group">
+                        <label class="checkbox-option">
+                            <input type="checkbox" id="cap142Debug">
+                            <span>CAP142 diagnostic snapshot only</span>
+                        </label>
+                    </div>
                 </div>
 
                 <div class="form-group">
@@ -683,6 +725,7 @@
                 payload.cap142Mode = currentCap142Mode();
                 payload.awbPrefix = document.getElementById("awbPrefix").value;
                 payload.originType = document.getElementById("originType").value;
+                payload.cap142Debug = document.getElementById("cap142Debug").checked;
 
                 if (payload.cap142Mode === "specific_flight") {
                     payload.flightCarrier = document.getElementById("flightCarrier").value;
@@ -839,20 +882,31 @@
             document.getElementById("jobMeta").textContent =
                 `${job.airports.length} ${unit} | ${job.startDate} to ${job.endDate} | ${progress}%`;
 
+            let actionsHtml = "";
             if (job.status === "completed" && job.downloadUrl) {
-                document.getElementById("jobActions").innerHTML =
-                    `<a class="download-link" href="${job.downloadUrl}">Download Excel file</a>`;
+                actionsHtml = `<a class="download-link" href="${job.downloadUrl}">Download Excel file</a>`;
             } else if (["queued", "running", "cancelling"].includes(job.status)) {
                 const disabled = job.status === "cancelling" ? "disabled" : "";
                 const label = job.status === "cancelling" ? "Aborting..." : "Abort job";
-                document.getElementById("jobActions").innerHTML =
-                    `<button type="button" class="danger-btn" id="abortBtn" ${disabled}>${label}</button>`;
-                const abortButton = document.getElementById("abortBtn");
-                if (abortButton) {
-                    abortButton.addEventListener("click", abortJob);
-                }
-            } else {
-                document.getElementById("jobActions").innerHTML = "";
+                actionsHtml = `<button type="button" class="danger-btn" id="abortBtn" ${disabled}>${label}</button>`;
+            }
+
+            if (job.debugFiles && job.debugFiles.length) {
+                actionsHtml += `
+                    <div class="debug-links">
+                        ${job.debugFiles.map((file) => `
+                            <a class="debug-link" href="${file.url}" target="_blank" rel="noopener">
+                                Debug: ${escapeHtml(file.name)}
+                            </a>
+                        `).join("")}
+                    </div>
+                `;
+            }
+
+            document.getElementById("jobActions").innerHTML = actionsHtml;
+            const abortButton = document.getElementById("abortBtn");
+            if (abortButton) {
+                abortButton.addEventListener("click", abortJob);
             }
 
             const logList = document.getElementById("logList");
