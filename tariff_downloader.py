@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Avianca iCargo TRF007 downloader.
+Avianca iCargo downloader.
 
 This module is designed to be called by the Flask web app, but it still has a
 small CLI for local/manual runs.
@@ -75,9 +75,10 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v15-export-settle-retry"
+DOWNLOADER_BUILD_VERSION = "job-api-v16-cap142-airport-bookings"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
+CAP142_MODES = {"specific_flight", "booking_period"}
 VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
 
 ProgressCallback = Callable[[str, int | None], None]
@@ -658,6 +659,7 @@ def switch_to_comm_role(driver: webdriver.Chrome) -> bool:
 
 def navigate_to_screen(driver: webdriver.Chrome, screen_num: str = "TRF007") -> bool:
     try:
+        screen_num = screen_num.upper()
         driver.switch_to.default_content()
         wait = WebDriverWait(driver, 20)
         screen_field = wait.until(EC.presence_of_element_located((By.ID, "ic-screen-search")))
@@ -666,8 +668,7 @@ def navigate_to_screen(driver: webdriver.Chrome, screen_num: str = "TRF007") -> 
         time.sleep(1)
         screen_field.send_keys(Keys.RETURN)
 
-        if screen_num == "TRF007":
-            wait.until(EC.presence_of_element_located((By.NAME, "iCargoContentFrameTRF007")))
+        wait.until(EC.presence_of_element_located((By.NAME, f"iCargoContentFrame{screen_num}")))
         time.sleep(2)
         return True
     except Exception:
@@ -679,12 +680,20 @@ def navigate_to_screen(driver: webdriver.Chrome, screen_num: str = "TRF007") -> 
         return False
 
 
-def enter_trf007_frame(driver: webdriver.Chrome, timeout: int = 20) -> WebDriverWait:
+def enter_screen_frame(driver: webdriver.Chrome, screen_num: str, timeout: int = 20) -> WebDriverWait:
     driver.switch_to.default_content()
     wait = WebDriverWait(driver, timeout)
-    iframe = wait.until(EC.presence_of_element_located((By.NAME, "iCargoContentFrameTRF007")))
+    iframe = wait.until(EC.presence_of_element_located((By.NAME, f"iCargoContentFrame{screen_num.upper()}")))
     driver.switch_to.frame(iframe)
     return wait
+
+
+def enter_trf007_frame(driver: webdriver.Chrome, timeout: int = 20) -> WebDriverWait:
+    return enter_screen_frame(driver, "TRF007", timeout=timeout)
+
+
+def enter_cap142_frame(driver: webdriver.Chrome, timeout: int = 20) -> WebDriverWait:
+    return enter_screen_frame(driver, "CAP142", timeout=timeout)
 
 
 def wait_for_icargo_idle(
@@ -752,7 +761,11 @@ def visible_export_link(driver: webdriver.Chrome):
                     el.value,
                     el.title,
                     el.id,
-                    el.name
+                    el.name,
+                    el.getAttribute('aria-label'),
+                    el.getAttribute('href'),
+                    el.getAttribute('src'),
+                    el.className
                 ].join(' ');
                 return /excel|export/i.test(text);
             })
@@ -780,6 +793,213 @@ def click_export_link(driver: webdriver.Chrome, export_link) -> str:
 
     driver.execute_script("arguments[0].click();", export_link)
     return "javascript click"
+
+
+def cap142_set_search_fields(
+    driver: webdriver.Chrome,
+    *,
+    mode: str,
+    origin: str,
+    origin_type: str,
+    start_date: str,
+    end_date: str,
+    awb_prefix: str,
+    flight_carrier: str,
+    flight_number: str,
+    cancel_callback: CancelCallback | None = None,
+) -> bool:
+    try:
+        check_cancelled(cancel_callback)
+        enter_cap142_frame(driver, timeout=20)
+        wait_for_icargo_idle(driver, timeout=20, cancel_callback=cancel_callback)
+
+        result = driver.execute_script(
+            """
+            const values = arguments[0];
+
+            function visible(el) {
+                if (!el || el.type === 'hidden') return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    Number(style.opacity || 1) > 0 &&
+                    rect.width > 0 &&
+                    rect.height > 0;
+            }
+
+            function controls() {
+                return Array.from(document.querySelectorAll('input, select, textarea'))
+                    .filter(visible)
+                    .sort((a, b) => {
+                        const ar = a.getBoundingClientRect();
+                        const br = b.getBoundingClientRect();
+                        if (Math.abs(ar.top - br.top) > 10) return ar.top - br.top;
+                        return ar.left - br.left;
+                    });
+            }
+
+            function setInput(el, value) {
+                if (!el) return false;
+                el.focus();
+                el.value = value || '';
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+                return true;
+            }
+
+            function setSelect(el, wanted) {
+                if (!el) return false;
+                const normalized = String(wanted || '').toLowerCase();
+                const option = Array.from(el.options || []).find((item) => {
+                    return String(item.textContent || '').trim().toLowerCase() === normalized ||
+                        String(item.value || '').trim().toLowerCase() === normalized;
+                }) || Array.from(el.options || []).find((item) => {
+                    return String(item.textContent || '').toLowerCase().includes(normalized);
+                });
+                if (!option) return false;
+                el.value = option.value;
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new Event('blur', { bubbles: true }));
+                return true;
+            }
+
+            const items = controls();
+            if (items.length < 10) {
+                return { ok: false, error: `Expected at least 10 visible controls, found ${items.length}` };
+            }
+
+            setInput(items[0], values.awbPrefix);
+            setInput(items[1], '');
+
+            if (values.mode === 'specific_flight') {
+                setInput(items[2], values.flightCarrier);
+                setInput(items[3], values.flightNumber);
+                setInput(items[4], values.startDate);
+                setInput(items[5], values.endDate);
+                setInput(items[6], '');
+                setInput(items[7], '');
+            } else {
+                setInput(items[2], values.flightCarrier || 'QT');
+                setInput(items[3], '');
+                setInput(items[4], '');
+                setInput(items[5], '');
+                setInput(items[6], values.startDate);
+                setInput(items[7], values.endDate);
+            }
+
+            if (!setSelect(items[8], values.originType)) {
+                return { ok: false, error: `Could not set origin type ${values.originType}` };
+            }
+            setInput(items[9], values.origin);
+
+            return {
+                ok: true,
+                controls: items.slice(0, 12).map((el, index) => ({
+                    index,
+                    tag: el.tagName,
+                    type: el.type || '',
+                    id: el.id || '',
+                    name: el.name || '',
+                    value: el.value || ''
+                }))
+            };
+            """,
+            {
+                "mode": mode,
+                "origin": origin,
+                "originType": origin_type,
+                "startDate": start_date,
+                "endDate": end_date,
+                "awbPrefix": awb_prefix,
+                "flightCarrier": flight_carrier,
+                "flightNumber": flight_number,
+            },
+        )
+
+        driver.switch_to.default_content()
+        if not result or not result.get("ok"):
+            logger.error("CAP142 field setup failed: %s", result)
+            return False
+        time.sleep(1)
+        return True
+    except Exception:
+        logger.exception("Could not set CAP142 search fields for %s", origin)
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+        return False
+
+
+def cap142_click_list(
+    driver: webdriver.Chrome,
+    origin: str,
+    cancel_callback: CancelCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> bool:
+    try:
+        check_cancelled(cancel_callback)
+        wait = enter_cap142_frame(driver, timeout=20)
+        wait_for_icargo_idle(driver, timeout=20, cancel_callback=cancel_callback)
+
+        list_button = wait.until(
+            lambda current_driver: current_driver.execute_script(
+                """
+                function visible(el) {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        Number(style.opacity || 1) > 0 &&
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        !el.disabled;
+                }
+                return Array.from(document.querySelectorAll('button, input, a'))
+                    .filter(visible)
+                    .find((el) => {
+                        const text = [
+                            el.innerText,
+                            el.textContent,
+                            el.value,
+                            el.title,
+                            el.id,
+                            el.name,
+                            el.className
+                        ].join(' ');
+                        return /\\blist\\b/i.test(text);
+                    }) || null;
+                """
+            )
+        )
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", list_button)
+        time.sleep(0.5)
+        driver.execute_script("arguments[0].click();", list_button)
+        emit(progress_callback, f"{origin}: CAP142 query submitted; waiting for results", None)
+
+        if not wait_for_query_results(
+            driver,
+            origin,
+            timeout=120,
+            cancel_callback=cancel_callback,
+            progress_callback=progress_callback,
+        ):
+            driver.switch_to.default_content()
+            return False
+
+        emit(progress_callback, f"{origin}: CAP142 results are ready", None)
+        driver.switch_to.default_content()
+        return True
+    except Exception:
+        logger.exception("Could not execute CAP142 query for %s", origin)
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+        return False
 
 
 def wait_for_query_results(
@@ -1085,7 +1305,11 @@ def rename_airport_export(downloaded_file: Path, airport: str, sequence: int) ->
     return target_path
 
 
-def merge_excel_files(file_directory: str | Path, output_filename: str = "merged_tariffs.xlsx") -> Path | None:
+def merge_excel_files(
+    file_directory: str | Path,
+    output_filename: str = "merged_tariffs.xlsx",
+    source_column: str = "Source Airport",
+) -> Path | None:
     target_dir = Path(file_directory)
     output_path = target_dir / output_filename
 
@@ -1104,8 +1328,8 @@ def merge_excel_files(file_directory: str | Path, output_filename: str = "merged
         try:
             df = pd.read_excel(excel_file)
             source_match = re.match(r"^\d{2}_([A-Z0-9]{3,8})_", excel_file.name)
-            if source_match and "Source Airport" not in df.columns:
-                df.insert(0, "Source Airport", source_match.group(1))
+            if source_match and source_column not in df.columns:
+                df.insert(0, source_column, source_match.group(1))
             dataframes.append(df)
             logger.info("Loaded %s (%s rows)", excel_file.name, len(df))
         except Exception as exc:
@@ -1150,11 +1374,208 @@ def upload_to_dropbox(config: DownloaderConfig, file_path: str | Path) -> bool:
         return False
 
 
+def run_cap142_workflow(
+    airports: Iterable[str] | None = None,
+    start_date: str | date | None = None,
+    end_date: str | date | None = None,
+    download_dir: str | Path | None = None,
+    upload_dropbox: bool = False,
+    send_email: bool = False,
+    progress_callback: ProgressCallback | None = None,
+    cancel_callback: CancelCallback | None = None,
+    cap142_mode: str = "booking_period",
+    flight_carrier: str = "QT",
+    flight_number: str | None = None,
+    awb_prefix: str = "729",
+    origin_type: str = "Airport",
+) -> dict:
+    config = DownloaderConfig.from_env(download_dir=download_dir)
+    config.validate()
+
+    mode = (cap142_mode or "booking_period").strip().lower()
+    if mode not in CAP142_MODES:
+        raise ValueError("CAP142 mode must be specific_flight or booking_period")
+
+    selected_origins = normalize_airports(airports)
+    if mode == "specific_flight" and len(selected_origins) != 1:
+        raise ValueError("Specific flight download needs exactly one origin airport")
+
+    if origin_type.strip().lower() != "airport":
+        raise ValueError("CAP142 country-origin automation is not enabled yet. Use Airport for now.")
+
+    awb_prefix = re.sub(r"\D", "", awb_prefix or "729") or "729"
+    flight_carrier = (flight_carrier or "QT").strip().upper()
+    flight_number = (flight_number or "").strip()
+    if mode == "specific_flight" and not flight_number:
+        raise ValueError("Flight number is required for CAP142 specific flight")
+
+    icargo_start_date, icargo_end_date = validate_date_range(start_date, end_date)
+    config.download_dir.mkdir(parents=True, exist_ok=True)
+
+    file_handler = add_file_logger(config.log_dir)
+    driver = None
+    successful_downloads = 0
+    failed_downloads = 0
+    downloaded_files = []
+
+    try:
+        check_cancelled(cancel_callback)
+        emit(progress_callback, "Starting Avianca CAP142 booking download", 3)
+        if mode == "specific_flight":
+            emit(progress_callback, f"Mode: specific flight {flight_carrier}{flight_number}", 4)
+            emit(progress_callback, f"Flight date: {icargo_start_date} to {icargo_end_date}", 5)
+        else:
+            emit(progress_callback, f"Mode: booking period for AWB prefix {awb_prefix}", 4)
+            emit(progress_callback, f"Booking date range: {icargo_start_date} to {icargo_end_date}", 5)
+        emit(progress_callback, f"Origins selected: {', '.join(selected_origins)}", 6)
+
+        driver = prepare_icargo_session(
+            config=config,
+            progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+            max_attempts=2,
+            screen_num="CAP142",
+        )
+
+        total_origins = len(selected_origins)
+        for index, origin in enumerate(selected_origins, start=1):
+            check_cancelled(cancel_callback)
+            base_progress = 30 + int(((index - 1) / total_origins) * 50)
+            emit(progress_callback, f"Processing {origin} ({index}/{total_origins})", base_progress)
+
+            downloaded_file = None
+            last_failure = "download did not complete"
+            max_origin_attempts = 3
+
+            for attempt in range(1, max_origin_attempts + 1):
+                check_cancelled(cancel_callback)
+                if attempt > 1:
+                    emit(
+                        progress_callback,
+                        f"{origin}: retrying from a fresh CAP142 screen ({attempt}/{max_origin_attempts})",
+                        base_progress,
+                    )
+                    if not navigate_to_screen(driver, "CAP142"):
+                        last_failure = "could not reopen CAP142"
+                        continue
+
+                emit(progress_callback, f"{origin}: setting CAP142 search fields", base_progress + 1)
+                if not cap142_set_search_fields(
+                    driver,
+                    mode=mode,
+                    origin=origin,
+                    origin_type=origin_type,
+                    start_date=icargo_start_date,
+                    end_date=icargo_end_date,
+                    awb_prefix=awb_prefix,
+                    flight_carrier=flight_carrier,
+                    flight_number=flight_number,
+                    cancel_callback=cancel_callback,
+                ):
+                    last_failure = "failed to set CAP142 search fields"
+                    continue
+
+                emit(progress_callback, f"{origin}: running CAP142 query", base_progress + 1)
+                if not cap142_click_list(
+                    driver,
+                    origin,
+                    cancel_callback=cancel_callback,
+                    progress_callback=progress_callback,
+                ):
+                    last_failure = "CAP142 query failed or returned no export"
+                    continue
+
+                emit(progress_callback, f"{origin}: exporting CAP142 Excel", base_progress + 2)
+                downloaded_file = download_results_as_excel(
+                    driver,
+                    config.download_dir,
+                    airport=origin,
+                    cancel_callback=cancel_callback,
+                    progress_callback=progress_callback,
+                )
+                if downloaded_file:
+                    break
+
+                last_failure = "CAP142 export failed or timed out"
+                if attempt < max_origin_attempts:
+                    emit(progress_callback, f"{origin}: no Excel file appeared; retrying full CAP142 query", base_progress)
+
+            if not downloaded_file:
+                failed_downloads += 1
+                emit(progress_callback, f"{origin}: {last_failure}", base_progress)
+                continue
+
+            downloaded_file = rename_airport_export(downloaded_file, origin, index)
+            downloaded_files.append(downloaded_file)
+            successful_downloads += 1
+            emit(progress_callback, f"{origin}: downloaded {downloaded_file.name}", base_progress + 3)
+            for _ in range(4):
+                check_cancelled(cancel_callback)
+                time.sleep(0.5)
+
+        if successful_downloads == 0:
+            raise RuntimeError("No CAP142 exports were downloaded")
+
+        check_cancelled(cancel_callback)
+        if mode == "specific_flight" and len(downloaded_files) == 1:
+            merged_file = downloaded_files[0]
+            emit(progress_callback, "CAP142 file is ready", 100)
+        elif len(downloaded_files) == 1:
+            merged_file = downloaded_files[0]
+            emit(progress_callback, "Single CAP142 file is ready", 100)
+        else:
+            emit(progress_callback, "Merging CAP142 Excel exports", 84)
+            output_name = f"CAP142_{successful_downloads}origins_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            merged_file = merge_excel_files(
+                config.download_dir,
+                output_filename=output_name,
+                source_column="Source Origin",
+            )
+            if not merged_file:
+                raise RuntimeError("CAP142 downloaded files could not be merged")
+
+        if upload_dropbox:
+            emit(progress_callback, "Uploading CAP142 file to Dropbox", 92)
+            upload_to_dropbox(config, merged_file)
+
+        result = {
+            "merged_file": str(merged_file),
+            "successful_downloads": successful_downloads,
+            "failed_downloads": failed_downloads,
+            "airports": selected_origins,
+            "start_date": icargo_start_date,
+            "end_date": icargo_end_date,
+            "module": "CAP142",
+            "cap142_mode": mode,
+        }
+
+        if send_email:
+            send_notification_email(config, success=True, details=json.dumps(result, indent=2))
+
+        emit(progress_callback, "CAP142 download workflow completed", 100)
+        return result
+
+    except Exception as exc:
+        if send_email:
+            try:
+                send_notification_email(config, success=False, details=str(exc))
+            except Exception:
+                logger.exception("Failed to send CAP142 failure notification email")
+        raise
+    finally:
+        if driver:
+            driver.quit()
+            logger.info("Browser closed")
+        logger.removeHandler(file_handler)
+        file_handler.close()
+
+
 def prepare_icargo_session(
     config: DownloaderConfig,
     progress_callback: ProgressCallback | None,
     cancel_callback: CancelCallback | None,
     max_attempts: int = 2,
+    screen_num: str = "TRF007",
 ) -> webdriver.Chrome:
     last_error = None
 
@@ -1184,9 +1605,9 @@ def prepare_icargo_session(
             emit(progress_callback, "Switched to COMM role", 23)
 
             check_cancelled(cancel_callback)
-            if not navigate_to_screen(driver, "TRF007"):
-                raise RuntimeError("Failed to navigate to TRF007")
-            emit(progress_callback, "Opened TRF007", 28)
+            if not navigate_to_screen(driver, screen_num):
+                raise RuntimeError(f"Failed to navigate to {screen_num}")
+            emit(progress_callback, f"Opened {screen_num}", 28)
 
             return driver
 
@@ -1223,7 +1644,33 @@ def run_download_workflow(
     send_email: bool = False,
     progress_callback: ProgressCallback | None = None,
     cancel_callback: CancelCallback | None = None,
+    module: str = "TRF007",
+    cap142_mode: str = "booking_period",
+    flight_carrier: str = "QT",
+    flight_number: str | None = None,
+    awb_prefix: str = "729",
+    origin_type: str = "Airport",
 ) -> dict:
+    module_code = (module or "TRF007").strip().upper()
+    if module_code == "CAP142":
+        return run_cap142_workflow(
+            airports=airports,
+            start_date=start_date,
+            end_date=end_date,
+            download_dir=download_dir,
+            upload_dropbox=upload_dropbox,
+            send_email=send_email,
+            progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+            cap142_mode=cap142_mode,
+            flight_carrier=flight_carrier,
+            flight_number=flight_number,
+            awb_prefix=awb_prefix,
+            origin_type=origin_type,
+        )
+    if module_code != "TRF007":
+        raise ValueError(f"Unsupported module: {module}")
+
     config = DownloaderConfig.from_env(download_dir=download_dir)
     config.validate()
 
