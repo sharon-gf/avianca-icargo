@@ -75,7 +75,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v26-cap142-processed-tab"
+DOWNLOADER_BUILD_VERSION = "job-api-v27-cap142-specific-flight"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
@@ -1815,7 +1815,16 @@ def build_cap142_processed_dataframe(
         source_origin = pd.Series([""] * len(raw_df), index=raw_df.index)
 
     source_origin = source_origin.fillna("").astype(str).str.strip()
-    processed_df["PAIS"] = source_origin.apply(lambda value: f"{awb_prefix} {value}".strip())
+    prefix = (awb_prefix or "").strip()
+    if not prefix and "AWB No." in processed_df.columns:
+        awb_values = processed_df["AWB No."].dropna().astype(str)
+        for awb_value in awb_values:
+            match = re.search(r"\b(\d{3})\b", awb_value)
+            if match:
+                prefix = match.group(1)
+                break
+
+    processed_df["PAIS"] = source_origin.apply(lambda value: f"{prefix} {value}".strip())
     return processed_df
 
 
@@ -1913,10 +1922,11 @@ def run_cap142_workflow(
     if origin_type.strip().lower() != "airport":
         raise ValueError("CAP142 country-origin automation is not enabled yet. Use Airport for now.")
 
-    awb_prefix = re.sub(r"\D", "", awb_prefix or "729") or "729"
     if mode == "specific_flight":
+        awb_prefix = ""
         flight_carrier = (flight_carrier or "QT").strip().upper()
     else:
+        awb_prefix = re.sub(r"\D", "", awb_prefix or "729") or "729"
         flight_carrier = ""
         flight_number = ""
     flight_number = (flight_number or "").strip()
