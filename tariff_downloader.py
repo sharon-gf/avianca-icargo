@@ -75,7 +75,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v16-cap142-airport-bookings"
+DOWNLOADER_BUILD_VERSION = "job-api-v17-cap142-field-detection"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
@@ -807,123 +807,228 @@ def cap142_set_search_fields(
     flight_carrier: str,
     flight_number: str,
     cancel_callback: CancelCallback | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> bool:
+    last_result = None
+    deadline = time.time() + 45
+    last_progress_at = 0.0
+
     try:
-        check_cancelled(cancel_callback)
-        enter_cap142_frame(driver, timeout=20)
-        wait_for_icargo_idle(driver, timeout=20, cancel_callback=cancel_callback)
+        while time.time() < deadline:
+            check_cancelled(cancel_callback)
+            enter_cap142_frame(driver, timeout=20)
+            wait_for_icargo_idle(driver, timeout=20, cancel_callback=cancel_callback)
 
-        result = driver.execute_script(
-            """
-            const values = arguments[0];
+            result = driver.execute_script(
+                """
+                const values = arguments[0];
 
-            function visible(el) {
-                if (!el || el.type === 'hidden') return false;
-                const style = window.getComputedStyle(el);
-                const rect = el.getBoundingClientRect();
-                return style.display !== 'none' &&
-                    style.visibility !== 'hidden' &&
-                    Number(style.opacity || 1) > 0 &&
-                    rect.width > 0 &&
-                    rect.height > 0;
-            }
+                function visible(el) {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        Number(style.opacity || 1) > 0 &&
+                        rect.width > 0 &&
+                        rect.height > 0;
+                }
 
-            function controls() {
-                return Array.from(document.querySelectorAll('input, select, textarea'))
-                    .filter(visible)
-                    .sort((a, b) => {
-                        const ar = a.getBoundingClientRect();
-                        const br = b.getBoundingClientRect();
-                        if (Math.abs(ar.top - br.top) > 10) return ar.top - br.top;
-                        return ar.left - br.left;
+                function sortByPosition(a, b) {
+                    const ar = a.getBoundingClientRect();
+                    const br = b.getBoundingClientRect();
+                    if (Math.abs(ar.top - br.top) > 10) return ar.top - br.top;
+                    return ar.left - br.left;
+                }
+
+                function editableInputs() {
+                    const ignoredTypes = new Set([
+                        'button',
+                        'checkbox',
+                        'file',
+                        'hidden',
+                        'image',
+                        'radio',
+                        'reset',
+                        'submit'
+                    ]);
+                    return Array.from(document.querySelectorAll('input, textarea'))
+                        .filter((el) => visible(el) && !ignoredTypes.has(String(el.type || '').toLowerCase()))
+                        .sort(sortByPosition);
+                }
+
+                function visibleSelects() {
+                    return Array.from(document.querySelectorAll('select'))
+                        .filter(visible)
+                        .sort(sortByPosition);
+                }
+
+                function setInput(el, value) {
+                    if (!el) return false;
+                    const nextValue = value || '';
+                    el.focus();
+                    try {
+                        const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+                        if (descriptor && descriptor.set) {
+                            descriptor.set.call(el, nextValue);
+                        } else {
+                            el.value = nextValue;
+                        }
+                    } catch (error) {
+                        el.value = nextValue;
+                    }
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    return true;
+                }
+
+                function setSelect(el, wanted) {
+                    if (!el) return false;
+                    const normalized = String(wanted || '').toLowerCase();
+                    const option = Array.from(el.options || []).find((item) => {
+                        return String(item.textContent || '').trim().toLowerCase() === normalized ||
+                            String(item.value || '').trim().toLowerCase() === normalized;
+                    }) || Array.from(el.options || []).find((item) => {
+                        return String(item.textContent || '').toLowerCase().includes(normalized);
                     });
-            }
+                    if (!option) return false;
+                    el.value = option.value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    el.dispatchEvent(new Event('blur', { bubbles: true }));
+                    return true;
+                }
 
-            function setInput(el, value) {
-                if (!el) return false;
-                el.focus();
-                el.value = value || '';
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new Event('blur', { bubbles: true }));
-                return true;
-            }
+                function describe(el, index) {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                        index,
+                        tag: el.tagName,
+                        type: el.type || '',
+                        id: el.id || '',
+                        name: el.name || '',
+                        title: el.title || '',
+                        value: el.value || '',
+                        top: Math.round(rect.top),
+                        left: Math.round(rect.left)
+                    };
+                }
 
-            function setSelect(el, wanted) {
-                if (!el) return false;
-                const normalized = String(wanted || '').toLowerCase();
-                const option = Array.from(el.options || []).find((item) => {
-                    return String(item.textContent || '').trim().toLowerCase() === normalized ||
-                        String(item.value || '').trim().toLowerCase() === normalized;
-                }) || Array.from(el.options || []).find((item) => {
-                    return String(item.textContent || '').toLowerCase().includes(normalized);
-                });
-                if (!option) return false;
-                el.value = option.value;
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new Event('blur', { bubbles: true }));
-                return true;
-            }
+                const textControls = editableInputs();
+                const selectControls = visibleSelects();
+                const bodyText = (document.body.innerText || '').slice(0, 1000);
 
-            const items = controls();
-            if (items.length < 10) {
-                return { ok: false, error: `Expected at least 10 visible controls, found ${items.length}` };
-            }
+                if (!/AWB\\s+Number/i.test(bodyText) || !/Flight\\s+No/i.test(bodyText)) {
+                    return {
+                        ok: false,
+                        retryable: true,
+                        error: 'CAP142 search form is not visible yet',
+                        textCount: textControls.length,
+                        selectCount: selectControls.length,
+                        bodyText
+                    };
+                }
 
-            setInput(items[0], values.awbPrefix);
-            setInput(items[1], '');
+                if (textControls.length < 9) {
+                    return {
+                        ok: false,
+                        retryable: true,
+                        error: `Expected at least 9 editable CAP142 fields, found ${textControls.length}`,
+                        textCount: textControls.length,
+                        selectCount: selectControls.length,
+                        controls: textControls.slice(0, 14).map(describe),
+                        selects: selectControls.slice(0, 4).map(describe)
+                    };
+                }
 
-            if (values.mode === 'specific_flight') {
-                setInput(items[2], values.flightCarrier);
-                setInput(items[3], values.flightNumber);
-                setInput(items[4], values.startDate);
-                setInput(items[5], values.endDate);
-                setInput(items[6], '');
-                setInput(items[7], '');
-            } else {
-                setInput(items[2], values.flightCarrier || 'QT');
-                setInput(items[3], '');
-                setInput(items[4], '');
-                setInput(items[5], '');
-                setInput(items[6], values.startDate);
-                setInput(items[7], values.endDate);
-            }
+                if (selectControls.length < 1) {
+                    return {
+                        ok: false,
+                        retryable: true,
+                        error: 'Could not find CAP142 origin type dropdown',
+                        textCount: textControls.length,
+                        selectCount: selectControls.length,
+                        controls: textControls.slice(0, 14).map(describe),
+                        selects: selectControls.slice(0, 4).map(describe)
+                    };
+                }
 
-            if (!setSelect(items[8], values.originType)) {
-                return { ok: false, error: `Could not set origin type ${values.originType}` };
-            }
-            setInput(items[9], values.origin);
+                setInput(textControls[0], values.awbPrefix);
+                setInput(textControls[1], '');
 
-            return {
-                ok: true,
-                controls: items.slice(0, 12).map((el, index) => ({
-                    index,
-                    tag: el.tagName,
-                    type: el.type || '',
-                    id: el.id || '',
-                    name: el.name || '',
-                    value: el.value || ''
-                }))
-            };
-            """,
-            {
-                "mode": mode,
-                "origin": origin,
-                "originType": origin_type,
-                "startDate": start_date,
-                "endDate": end_date,
-                "awbPrefix": awb_prefix,
-                "flightCarrier": flight_carrier,
-                "flightNumber": flight_number,
-            },
-        )
+                if (values.mode === 'specific_flight') {
+                    setInput(textControls[2], values.flightCarrier);
+                    setInput(textControls[3], values.flightNumber);
+                    setInput(textControls[4], values.startDate);
+                    setInput(textControls[5], values.endDate);
+                    setInput(textControls[6], '');
+                    setInput(textControls[7], '');
+                } else {
+                    setInput(textControls[2], values.flightCarrier || 'QT');
+                    setInput(textControls[3], '');
+                    setInput(textControls[4], '');
+                    setInput(textControls[5], '');
+                    setInput(textControls[6], values.startDate);
+                    setInput(textControls[7], values.endDate);
+                }
 
-        driver.switch_to.default_content()
-        if not result or not result.get("ok"):
-            logger.error("CAP142 field setup failed: %s", result)
-            return False
-        time.sleep(1)
-        return True
+                if (!setSelect(selectControls[0], values.originType)) {
+                    return {
+                        ok: false,
+                        retryable: false,
+                        error: `Could not set origin type ${values.originType}`,
+                        textCount: textControls.length,
+                        selectCount: selectControls.length,
+                        selects: selectControls.slice(0, 4).map(describe)
+                    };
+                }
+
+                setInput(textControls[8], values.origin);
+
+                return {
+                    ok: true,
+                    textControls: textControls.slice(0, 12).map(describe),
+                    selects: selectControls.slice(0, 4).map(describe)
+                };
+                """,
+                {
+                    "mode": mode,
+                    "origin": origin,
+                    "originType": origin_type,
+                    "startDate": start_date,
+                    "endDate": end_date,
+                    "awbPrefix": awb_prefix,
+                    "flightCarrier": flight_carrier,
+                    "flightNumber": flight_number,
+                },
+            )
+
+            driver.switch_to.default_content()
+            last_result = result
+            if result and result.get("ok"):
+                time.sleep(1)
+                return True
+
+            if result and not result.get("retryable", True):
+                break
+
+            now = time.time()
+            if progress_callback and now - last_progress_at >= 12:
+                error = result.get("error", "waiting for CAP142 form") if isinstance(result, dict) else "waiting for CAP142 form"
+                emit(progress_callback, f"{origin}: waiting for CAP142 fields ({error})", None)
+                last_progress_at = now
+            time.sleep(2)
+
+        logger.error("CAP142 field setup failed: %s", last_result)
+        if progress_callback:
+            if isinstance(last_result, dict):
+                error = last_result.get("error", "field setup failed")
+            else:
+                error = "field setup failed"
+            emit(progress_callback, f"{origin}: CAP142 field setup failed ({error})", None)
+        return False
     except Exception:
         logger.exception("Could not set CAP142 search fields for %s", origin)
         try:
@@ -1161,6 +1266,7 @@ def download_results_as_excel(
     airport: str,
     cancel_callback: CancelCallback | None = None,
     progress_callback: ProgressCallback | None = None,
+    screen_num: str = "TRF007",
 ) -> Path | None:
     try:
         existing_names = {
@@ -1170,7 +1276,7 @@ def download_results_as_excel(
         }
 
         check_cancelled(cancel_callback)
-        wait = enter_trf007_frame(driver, timeout=20)
+        wait = enter_screen_frame(driver, screen_num, timeout=20)
         wait_for_icargo_idle(driver, timeout=20, cancel_callback=cancel_callback)
 
         try:
@@ -1186,7 +1292,7 @@ def download_results_as_excel(
             check_cancelled(cancel_callback)
             time.sleep(1)
 
-        wait = enter_trf007_frame(driver, timeout=20)
+        wait = enter_screen_frame(driver, screen_num, timeout=20)
         export_link = wait.until(lambda current_driver: visible_export_link(current_driver))
         click_time = time.time()
         click_method = click_export_link(driver, export_link)
@@ -1471,6 +1577,7 @@ def run_cap142_workflow(
                     flight_carrier=flight_carrier,
                     flight_number=flight_number,
                     cancel_callback=cancel_callback,
+                    progress_callback=progress_callback,
                 ):
                     last_failure = "failed to set CAP142 search fields"
                     continue
@@ -1492,6 +1599,7 @@ def run_cap142_workflow(
                     airport=origin,
                     cancel_callback=cancel_callback,
                     progress_callback=progress_callback,
+                    screen_num="CAP142",
                 )
                 if downloaded_file:
                     break
