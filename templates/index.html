@@ -682,11 +682,12 @@
             if (module === "CAP142") {
                 payload.cap142Mode = currentCap142Mode();
                 payload.awbPrefix = document.getElementById("awbPrefix").value;
-                payload.flightCarrier = document.getElementById("flightCarrier").value;
-                payload.flightNumber = document.getElementById("flightNumber").value;
                 payload.originType = document.getElementById("originType").value;
 
                 if (payload.cap142Mode === "specific_flight") {
+                    payload.flightCarrier = document.getElementById("flightCarrier").value;
+                    payload.flightNumber = document.getElementById("flightNumber").value;
+
                     if (airports.length !== 1) {
                         showStatus("Specific flight mode needs exactly one origin.", "error");
                         return;
@@ -695,6 +696,9 @@
                         showStatus("Enter a flight number.", "error");
                         return;
                     }
+                } else {
+                    payload.flightCarrier = "";
+                    payload.flightNumber = "";
                 }
             }
 
