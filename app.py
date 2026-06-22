@@ -44,6 +44,7 @@ DEFAULT_AIRPORTS = [
     "SZX",
     "KIX",
     "LHE",
+    "MIA",
 ]
 MAX_RANGE_DAYS = 15
 
@@ -64,7 +65,7 @@ JOBS: dict[str, dict] = {}
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v16-cap142-specific-flight"
+APP_BUILD_VERSION = "job-api-v18-cap142-blank-origin"
 
 
 def now_iso() -> str:
@@ -393,10 +394,15 @@ def start_download():
         start_date = data.get("startDate")
         end_date = data.get("endDate")
         cap142_options = {}
+        cap142_mode = str(data.get("cap142Mode", "booking_period")).strip().lower()
 
         if module not in {"TRF007", "CAP142"}:
             return jsonify({"error": "Only TRF007 and CAP142 are currently supported"}), 400
-        if not airports:
+        if module == "CAP142" and cap142_mode not in {"specific_flight", "booking_period"}:
+            return jsonify({"error": "CAP142 mode must be booking_period or specific_flight"}), 400
+
+        origin_is_optional = module == "CAP142" and cap142_mode == "specific_flight"
+        if not airports and not origin_is_optional:
             return jsonify({"error": "No origins selected"}), 400
 
         allowed_airports = set(DEFAULT_AIRPORTS)
@@ -405,10 +411,6 @@ def start_download():
             return jsonify({"error": f"Invalid airports: {', '.join(invalid_airports)}"}), 400
 
         if module == "CAP142":
-            cap142_mode = str(data.get("cap142Mode", "booking_period")).strip().lower()
-            if cap142_mode not in {"specific_flight", "booking_period"}:
-                return jsonify({"error": "CAP142 mode must be booking_period or specific_flight"}), 400
-
             if cap142_mode == "specific_flight":
                 awb_prefix = ""
                 flight_carrier = str(data.get("flightCarrier", "QT")).strip().upper() or "QT"
@@ -422,8 +424,8 @@ def start_download():
             if origin_type.lower() != "airport":
                 return jsonify({"error": "CAP142 country origin is not automated yet. Please use Airport."}), 400
             if cap142_mode == "specific_flight":
-                if len(airports) != 1:
-                    return jsonify({"error": "Specific flight mode needs exactly one origin airport"}), 400
+                if len(airports) > 1:
+                    return jsonify({"error": "Specific flight mode can use one origin or no origin filter"}), 400
                 if not flight_number:
                     return jsonify({"error": "Flight number is required for CAP142 specific flight"}), 400
 

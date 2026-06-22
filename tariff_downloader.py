@@ -70,12 +70,13 @@ DEFAULT_AIRPORTS = [
     "SZX",
     "KIX",
     "LHE",
+    "MIA",
 ]
 
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v27-cap142-specific-flight"
+DOWNLOADER_BUILD_VERSION = "job-api-v29-cap142-blank-origin"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
@@ -188,6 +189,32 @@ def normalize_airports(airports: Iterable[str] | None) -> list[str]:
     if not normalized:
         raise ValueError("At least one airport is required")
     return normalized
+
+
+def normalize_cap142_origins(origins: Iterable[str] | None, mode: str) -> list[str]:
+    if mode != "specific_flight":
+        return normalize_airports(origins)
+
+    normalized = []
+    for origin in origins or []:
+        code = origin.strip().upper()
+        if not code:
+            continue
+        if not re.fullmatch(r"[A-Z0-9]{3}", code):
+            raise ValueError(f"Invalid origin code: {origin}")
+        normalized.append(code)
+
+    if len(normalized) > 1:
+        raise ValueError("Specific flight download can use one origin or no origin filter")
+    return normalized or [""]
+
+
+def origin_display_name(origin: str | None) -> str:
+    return (origin or "").strip().upper() or "origin left blank"
+
+
+def origin_file_code(origin: str | None) -> str:
+    return (origin or "").strip().upper() or "BLANK"
 
 
 def parse_iso_date(value: str | date) -> date:
@@ -917,6 +944,7 @@ def cap142_ensure_search_form_visible(
     progress_callback: ProgressCallback | None = None,
     timeout: int = 45,
 ) -> bool:
+    origin_label = origin_display_name(origin)
     deadline = time.time() + timeout
     clicked_edit = False
     last_result = None
@@ -1065,7 +1093,7 @@ def cap142_ensure_search_form_visible(
 
         if result and result.get("clicked"):
             if not clicked_edit:
-                emit(progress_callback, f"{origin}: opening CAP142 search fields", None)
+                emit(progress_callback, f"{origin_label}: opening CAP142 search fields", None)
                 clicked_edit = True
             time.sleep(2)
             continue
@@ -1073,7 +1101,7 @@ def cap142_ensure_search_form_visible(
         time.sleep(2)
 
     logger.error("CAP142 search form could not be reopened: %s", last_result)
-    emit(progress_callback, f"{origin}: CAP142 search form is still hidden", None)
+    emit(progress_callback, f"{origin_label}: CAP142 search form is still hidden", None)
     return False
 
 
@@ -1091,6 +1119,7 @@ def cap142_set_search_fields(
     cancel_callback: CancelCallback | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> bool:
+    origin_label = origin_display_name(origin)
     last_result = None
     deadline = time.time() + 45
     last_progress_at = 0.0
@@ -1293,17 +1322,17 @@ def cap142_set_search_fields(
             last_result = result
             if result and result.get("ok"):
                 if progress_callback:
-                    emit(progress_callback, f"{origin}: CAP142 actual fields: {cap142_field_summary(result, mode)}", None)
+                    emit(progress_callback, f"{origin_label}: CAP142 actual fields: {cap142_field_summary(result, mode)}", None)
                     if mode == "specific_flight":
                         emit(
                             progress_callback,
-                            f"{origin}: CAP142 fields entered (flight {flight_carrier}{flight_number}, dates {start_date} to {end_date}, origin {origin})",
+                            f"{origin_label}: CAP142 fields entered (flight {flight_carrier}{flight_number}, dates {start_date} to {end_date}, origin {origin_label})",
                             None,
                         )
                     else:
                         emit(
                             progress_callback,
-                            f"{origin}: CAP142 fields entered (AWB {awb_prefix}, flight blank, booking {start_date} to {end_date}, origin {origin})",
+                            f"{origin_label}: CAP142 fields entered (AWB {awb_prefix}, flight blank, booking {start_date} to {end_date}, origin {origin_label})",
                             None,
                         )
                 time.sleep(1)
@@ -1315,7 +1344,7 @@ def cap142_set_search_fields(
             now = time.time()
             if progress_callback and now - last_progress_at >= 12:
                 error = result.get("error", "waiting for CAP142 form") if isinstance(result, dict) else "waiting for CAP142 form"
-                emit(progress_callback, f"{origin}: waiting for CAP142 fields ({error})", None)
+                emit(progress_callback, f"{origin_label}: waiting for CAP142 fields ({error})", None)
                 last_progress_at = now
             time.sleep(2)
 
@@ -1325,10 +1354,10 @@ def cap142_set_search_fields(
                 error = last_result.get("error", "field setup failed")
             else:
                 error = "field setup failed"
-            emit(progress_callback, f"{origin}: CAP142 field setup failed ({error})", None)
+            emit(progress_callback, f"{origin_label}: CAP142 field setup failed ({error})", None)
         return False
     except Exception:
-        logger.exception("Could not set CAP142 search fields for %s", origin)
+        logger.exception("Could not set CAP142 search fields for %s", origin_label)
         try:
             driver.switch_to.default_content()
         except Exception:
@@ -1343,6 +1372,7 @@ def cap142_click_list(
     progress_callback: ProgressCallback | None = None,
     debug_dir: Path | None = None,
 ) -> bool:
+    origin_label = origin_display_name(origin)
     try:
         check_cancelled(cancel_callback)
         wait = enter_cap142_frame(driver, timeout=20)
@@ -1382,26 +1412,26 @@ def cap142_click_list(
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", list_button)
         time.sleep(0.5)
         driver.execute_script("arguments[0].click();", list_button)
-        emit(progress_callback, f"{origin}: CAP142 query submitted; waiting for results", None)
+        emit(progress_callback, f"{origin_label}: CAP142 query submitted; waiting for results", None)
 
         if not wait_for_query_results(
             driver,
-            origin,
+            origin_label,
             timeout=120,
             cancel_callback=cancel_callback,
             progress_callback=progress_callback,
             no_results_confirm_seconds=45,
             debug_dir=debug_dir,
-            debug_label=f"CAP142_{origin}_no_rows",
+            debug_label=f"CAP142_{origin_file_code(origin)}_no_rows",
         ):
             driver.switch_to.default_content()
             return False
 
-        emit(progress_callback, f"{origin}: CAP142 results are ready", None)
+        emit(progress_callback, f"{origin_label}: CAP142 results are ready", None)
         driver.switch_to.default_content()
         return True
     except Exception:
-        logger.exception("Could not execute CAP142 query for %s", origin)
+        logger.exception("Could not execute CAP142 query for %s", origin_label)
         try:
             driver.switch_to.default_content()
         except Exception:
@@ -1767,7 +1797,9 @@ def merge_excel_files(
             df = pd.read_excel(excel_file)
             source_match = re.match(r"^\d{2}_([A-Z0-9]{3,8})_", excel_file.name)
             if source_match and source_column not in df.columns:
-                df.insert(0, source_column, source_match.group(1))
+                inferred_source = source_match.group(1)
+                if inferred_source != "BLANK":
+                    df.insert(0, source_column, inferred_source)
             dataframes.append(df)
             logger.info("Loaded %s (%s rows)", excel_file.name, len(df))
         except Exception as exc:
@@ -1793,7 +1825,10 @@ def merge_excel_files(
 def source_from_export_filename(file_path: str | Path) -> str | None:
     match = re.match(r"^\d{2}_([A-Z0-9]{3,8})_", Path(file_path).name)
     if match:
-        return match.group(1)
+        inferred_source = match.group(1)
+        if inferred_source == "BLANK":
+            return None
+        return inferred_source
     return None
 
 
@@ -1815,6 +1850,9 @@ def build_cap142_processed_dataframe(
         source_origin = pd.Series([""] * len(raw_df), index=raw_df.index)
 
     source_origin = source_origin.fillna("").astype(str).str.strip()
+    if source_origin.eq("").all() and "Origin" in processed_df.columns:
+        source_origin = processed_df["Origin"].fillna("").astype(str).str.strip()
+
     prefix = (awb_prefix or "").strip()
     if not prefix and "AWB No." in processed_df.columns:
         awb_values = processed_df["AWB No."].dropna().astype(str)
@@ -1915,9 +1953,7 @@ def run_cap142_workflow(
     if mode not in CAP142_MODES:
         raise ValueError("CAP142 mode must be specific_flight or booking_period")
 
-    selected_origins = normalize_airports(airports)
-    if mode == "specific_flight" and len(selected_origins) != 1:
-        raise ValueError("Specific flight download needs exactly one origin airport")
+    selected_origins = normalize_cap142_origins(airports, mode)
 
     if origin_type.strip().lower() != "airport":
         raise ValueError("CAP142 country-origin automation is not enabled yet. Use Airport for now.")
@@ -1954,7 +1990,8 @@ def run_cap142_workflow(
         else:
             emit(progress_callback, f"Mode: booking period for AWB prefix {awb_prefix}", 4)
             emit(progress_callback, f"Booking date range: {icargo_start_date} to {icargo_end_date}", 5)
-        emit(progress_callback, f"Origins selected: {', '.join(selected_origins)}", 6)
+        origin_summary = ", ".join(origin_display_name(origin) for origin in selected_origins)
+        emit(progress_callback, f"Origins selected: {origin_summary}", 6)
         if cap142_debug:
             emit(progress_callback, "CAP142 diagnostic mode: will stop after saving a screenshot", 7)
 
@@ -1970,8 +2007,10 @@ def run_cap142_workflow(
         total_origins = len(selected_origins)
         for index, origin in enumerate(selected_origins, start=1):
             check_cancelled(cancel_callback)
+            origin_label = origin_display_name(origin)
+            origin_code = origin_file_code(origin)
             base_progress = 30 + int(((index - 1) / total_origins) * 50)
-            emit(progress_callback, f"Processing {origin} ({index}/{total_origins})", base_progress)
+            emit(progress_callback, f"Processing {origin_label} ({index}/{total_origins})", base_progress)
 
             downloaded_file = None
             last_failure = "download did not complete"
@@ -1982,14 +2021,14 @@ def run_cap142_workflow(
                 if attempt > 1:
                     emit(
                         progress_callback,
-                        f"{origin}: retrying from a fresh CAP142 screen ({attempt}/{max_origin_attempts})",
+                        f"{origin_label}: retrying from a fresh CAP142 screen ({attempt}/{max_origin_attempts})",
                         base_progress,
                     )
                     if not navigate_to_screen(driver, "CAP142"):
                         last_failure = "could not reopen CAP142"
                         continue
 
-                emit(progress_callback, f"{origin}: setting CAP142 search fields", base_progress + 1)
+                emit(progress_callback, f"{origin_label}: setting CAP142 search fields", base_progress + 1)
                 if not cap142_set_search_fields(
                     driver,
                     mode=mode,
@@ -2010,15 +2049,15 @@ def run_cap142_workflow(
                     saved_files = save_cap142_debug_snapshot(
                         driver,
                         debug_dir,
-                        f"CAP142_{origin}_after_fields",
+                        f"CAP142_{origin_code}_after_fields",
                     )
                     if saved_files:
-                        emit(progress_callback, f"{origin}: diagnostic snapshot saved", base_progress + 2)
+                        emit(progress_callback, f"{origin_label}: diagnostic snapshot saved", base_progress + 2)
                     else:
-                        emit(progress_callback, f"{origin}: diagnostic snapshot could not be saved", base_progress + 2)
+                        emit(progress_callback, f"{origin_label}: diagnostic snapshot could not be saved", base_progress + 2)
                     raise RuntimeError("CAP142 diagnostic snapshot saved. No download was attempted.")
 
-                emit(progress_callback, f"{origin}: running CAP142 query", base_progress + 1)
+                emit(progress_callback, f"{origin_label}: running CAP142 query", base_progress + 1)
                 if not cap142_click_list(
                     driver,
                     origin,
@@ -2029,11 +2068,11 @@ def run_cap142_workflow(
                     last_failure = "CAP142 query failed or returned no export"
                     continue
 
-                emit(progress_callback, f"{origin}: exporting CAP142 Excel", base_progress + 2)
+                emit(progress_callback, f"{origin_label}: exporting CAP142 Excel", base_progress + 2)
                 downloaded_file = download_results_as_excel(
                     driver,
                     config.download_dir,
-                    airport=origin,
+                    airport=origin_label,
                     cancel_callback=cancel_callback,
                     progress_callback=progress_callback,
                     screen_num="CAP142",
@@ -2045,17 +2084,20 @@ def run_cap142_workflow(
 
                 last_failure = "CAP142 export failed or timed out"
                 if attempt < max_origin_attempts:
-                    emit(progress_callback, f"{origin}: no Excel file appeared; retrying full CAP142 query", base_progress)
+                    emit(progress_callback, f"{origin_label}: no Excel file appeared; retrying full CAP142 query", base_progress)
 
             if not downloaded_file:
                 failed_downloads += 1
-                emit(progress_callback, f"{origin}: {last_failure}", base_progress)
+                emit(progress_callback, f"{origin_label}: {last_failure}", base_progress)
                 continue
 
-            downloaded_file = rename_airport_export(downloaded_file, origin, index)
+            downloaded_file = rename_airport_export(downloaded_file, origin_code, index)
             downloaded_files.append(downloaded_file)
             successful_downloads += 1
-            emit(progress_callback, f"{origin}: downloaded {downloaded_file.name}", base_progress + 3)
+            if origin:
+                emit(progress_callback, f"{origin_label}: downloaded {downloaded_file.name}", base_progress + 3)
+            else:
+                emit(progress_callback, f"{origin_label}: downloaded CAP142 Excel", base_progress + 3)
             for _ in range(4):
                 check_cancelled(cancel_callback)
                 time.sleep(0.5)
@@ -2085,7 +2127,7 @@ def run_cap142_workflow(
         merged_file = write_cap142_workbook_with_processed_tab(
             merged_file,
             awb_prefix=awb_prefix,
-            default_origin=selected_origins[0] if len(selected_origins) == 1 else None,
+            default_origin=selected_origins[0] if len(selected_origins) == 1 and selected_origins[0] else None,
         )
 
         if upload_dropbox:
