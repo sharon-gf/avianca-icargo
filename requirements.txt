@@ -7,3 +7,4 @@ selenium==4.15.2
 webdriver-manager==4.0.1
 schedule==1.2.0
 dropbox==11.36.2
+playwright==1.45.0
