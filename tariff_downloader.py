@@ -76,7 +76,7 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v31-cap142-vvi-compare"
+DOWNLOADER_BUILD_VERSION = "job-api-v33-cap142-vvi-awb-only"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
@@ -2033,6 +2033,12 @@ def filter_csprod_flight_rows(
     flight_number: str,
     flight_date_value: str,
 ) -> pd.DataFrame:
+    column_text = " ".join(str(column).lower() for column in df.columns)
+    has_flight_columns = "flight" in column_text or "flt" in column_text
+    has_date_columns = "date" in column_text or "dt" in column_text
+    if not has_flight_columns and not has_date_columns:
+        return df.copy()
+
     target_date = cap142_target_date(flight_date_value)
     matches = df.apply(
         lambda row: row_matches_flight(row, flight_carrier, flight_number, target_date),
@@ -2247,8 +2253,9 @@ def add_live_system_comparison(
     workbook_path = Path(workbook_path)
     icargo_df = pd.read_excel(workbook_path, sheet_name="Processed")
     system_df = pd.read_excel(csprod_path)
-    system_flight_df = filter_csprod_flight_rows(system_df, flight_carrier, flight_number, flight_date)
-    emit(progress_callback, f"VVI rows matched for this flight: {len(system_flight_df)}", 95)
+    emit(progress_callback, f"VVI rows downloaded: {len(system_df)}", 95)
+    system_flight_df = system_df.copy()
+    emit(progress_callback, f"Using all {len(system_flight_df)} VVI row(s) for AWB comparison", 95)
 
     icargo_awbs = dataframe_awb_map(icargo_df)
     system_awbs = dataframe_awb_map(system_flight_df, preferred_column_indexes=[3])
