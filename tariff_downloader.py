@@ -1986,6 +1986,24 @@ def dataframe_awb_map(df: pd.DataFrame, preferred_column_indexes: Iterable[int] 
     return awbs
 
 
+def filter_cancelled_icargo_bookings(df: pd.DataFrame) -> tuple[pd.DataFrame, int, set[str]]:
+    columns = {str(column).strip().lower(): column for column in df.columns}
+    status_column = columns.get("booking status")
+    if status_column is None and len(df.columns) >= 6:
+        status_column = df.columns[5]
+    if status_column is None:
+        return df.copy(), 0, set()
+
+    statuses = df[status_column].fillna("").astype(str).str.strip().str.casefold()
+    cancelled_mask = statuses.eq("cancelled")
+    if not cancelled_mask.any():
+        return df.copy(), 0, set()
+
+    cancelled_awbs = set(dataframe_awb_map(df.loc[cancelled_mask]))
+    active_df = df.loc[~cancelled_mask].copy()
+    return active_df, int(cancelled_mask.sum()), cancelled_awbs
+
+
 def parse_compare_date(value: object) -> date | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -2278,11 +2296,18 @@ def add_live_system_comparison(
     icargo_df = pd.read_excel(workbook_path, sheet_name="Processed")
     system_df = pd.read_excel(csprod_path)
     emit(progress_callback, f"VVI rows downloaded: {len(system_df)}", 95)
+    icargo_compare_df, cancelled_icargo_rows, cancelled_icargo_awbs = filter_cancelled_icargo_bookings(icargo_df)
+    if cancelled_icargo_awbs:
+        emit(progress_callback, f"Ignoring {len(cancelled_icargo_awbs)} cancelled iCargo AWB(s)", 95)
     system_flight_df = system_df.copy()
     emit(progress_callback, f"Using all {len(system_flight_df)} VVI row(s) for AWB comparison", 95)
 
-    icargo_awbs = dataframe_awb_map(icargo_df)
+    icargo_awbs = dataframe_awb_map(icargo_compare_df)
+    for key in cancelled_icargo_awbs:
+        icargo_awbs.pop(key, None)
     system_awbs = dataframe_awb_map(system_flight_df, preferred_column_indexes=[3])
+    for key in cancelled_icargo_awbs:
+        system_awbs.pop(key, None)
     icargo_keys = set(icargo_awbs)
     system_keys = set(system_awbs)
 
@@ -2296,6 +2321,8 @@ def add_live_system_comparison(
             {"Metric": "System query", "Value": CSPROD_QUERY_NAME},
             {"Metric": "System AWB source", "Value": "VVI column 4"},
             {"Metric": "iCargo AWBs", "Value": len(icargo_keys)},
+            {"Metric": "Cancelled iCargo rows ignored", "Value": cancelled_icargo_rows},
+            {"Metric": "Cancelled iCargo AWBs ignored", "Value": len(cancelled_icargo_awbs)},
             {"Metric": "VVI AWBs", "Value": len(system_keys)},
             {"Metric": "Missing in iCargo", "Value": len(missing_in_icargo)},
             {"Metric": "Missing in VVI", "Value": len(missing_in_system)},
