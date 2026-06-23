@@ -1812,11 +1812,14 @@ def merge_excel_files(
     for excel_file in excel_files:
         try:
             df = pd.read_excel(excel_file)
-            source_match = re.match(r"^\d{2}_([A-Z0-9]{3,8})_", excel_file.name)
-            if source_match and source_column not in df.columns:
+            source_match = re.match(r"^\d{2}_([A-Z0-9]{2,8})_", excel_file.name)
+            if source_match:
                 inferred_source = source_match.group(1)
                 if inferred_source != "BLANK":
-                    df.insert(0, source_column, inferred_source)
+                    if source_column in df.columns:
+                        df[source_column] = inferred_source
+                    else:
+                        df.insert(0, source_column, inferred_source)
             dataframes.append(df)
             logger.info("Loaded %s (%s rows)", excel_file.name, len(df))
         except Exception as exc:
@@ -1840,7 +1843,7 @@ def merge_excel_files(
 
 
 def source_from_export_filename(file_path: str | Path) -> str | None:
-    match = re.match(r"^\d{2}_([A-Z0-9]{3,8})_", Path(file_path).name)
+    match = re.match(r"^\d{2}_([A-Z0-9]{2,8})_", Path(file_path).name)
     if match:
         inferred_source = match.group(1)
         if inferred_source == "BLANK":
@@ -1862,13 +1865,11 @@ def build_cap142_processed_dataframe(
         processed_df[output_name] = raw_df[raw_name].ffill()
 
     if "Source Origin" in raw_df.columns:
-        source_origin = raw_df["Source Origin"].ffill()
+        source_origin = raw_df["Source Origin"]
     else:
         source_origin = pd.Series([""] * len(raw_df), index=raw_df.index)
 
     source_origin = source_origin.fillna("").astype(str).str.strip()
-    if source_origin.eq("").all() and "Origin" in processed_df.columns:
-        source_origin = processed_df["Origin"].fillna("").astype(str).str.strip()
 
     prefix = (awb_prefix or "").strip()
     if not prefix and "AWB No." in processed_df.columns:
@@ -1879,7 +1880,7 @@ def build_cap142_processed_dataframe(
                 prefix = match.group(1)
                 break
 
-    processed_df["PAIS"] = source_origin.apply(lambda value: f"{prefix} {value}".strip())
+    processed_df["PAIS"] = source_origin.apply(lambda value: f"{prefix}{value}".strip())
     return processed_df
 
 
@@ -1892,11 +1893,14 @@ def write_cap142_workbook_with_processed_tab(
     output_path = workbook_path if workbook_path.suffix.lower() == ".xlsx" else workbook_path.with_suffix(".xlsx")
     raw_df = pd.read_excel(workbook_path, sheet_name=0)
 
+    inferred_origin = default_origin or source_from_export_filename(workbook_path) or ""
     if "Source Origin" not in raw_df.columns:
-        inferred_origin = default_origin or source_from_export_filename(workbook_path) or ""
         raw_df.insert(0, "Source Origin", inferred_origin)
     else:
-        raw_df["Source Origin"] = raw_df["Source Origin"].ffill()
+        if inferred_origin:
+            raw_df["Source Origin"] = inferred_origin
+        else:
+            raw_df["Source Origin"] = raw_df["Source Origin"].fillna("")
 
     processed_df = build_cap142_processed_dataframe(raw_df, awb_prefix=awb_prefix)
 
