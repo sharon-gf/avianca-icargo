@@ -2004,6 +2004,66 @@ def filter_cancelled_icargo_bookings(df: pd.DataFrame) -> tuple[pd.DataFrame, in
     return active_df, int(cancelled_mask.sum()), cancelled_awbs
 
 
+def row_value_by_column(
+    row_data: dict[str, object] | None,
+    columns: Iterable[object],
+    column_index: int,
+    fallback_name: str | None = None,
+) -> object:
+    if not row_data:
+        return ""
+
+    column_list = list(columns)
+    if 0 <= column_index < len(column_list):
+        column_key = str(column_list[column_index])
+        if column_key in row_data:
+            return row_data.get(column_key, "")
+
+    if fallback_name and fallback_name in row_data:
+        return row_data.get(fallback_name, "")
+    return ""
+
+
+def parse_chw_number(value: object) -> float | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, int | float):
+        return float(value)
+
+    match = re.search(r"-?\d+(?:,\d{3})*(?:\.\d+)?|-?\d+(?:\.\d+)?", str(value))
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def chw_difference(icargo_chw: object, system_chw: object) -> float | str:
+    icargo_value = parse_chw_number(icargo_chw)
+    system_value = parse_chw_number(system_chw)
+    if icargo_value is None or system_value is None:
+        return ""
+    return round(icargo_value - system_value, 3)
+
+
+def remove_workbook_sheets(workbook_path: Path, sheet_names: Iterable[str]) -> None:
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        logger.info("openpyxl is unavailable; obsolete comparison tabs could not be removed")
+        return
+
+    workbook = load_workbook(workbook_path)
+    removed = False
+    for sheet_name in sheet_names:
+        if sheet_name in workbook.sheetnames and len(workbook.sheetnames) > 1:
+            del workbook[sheet_name]
+            removed = True
+    if removed:
+        workbook.save(workbook_path)
+
+
 def parse_compare_date(value: object) -> date | None:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -2102,9 +2162,9 @@ def style_compare_sheets(workbook_path: Path) -> None:
         header_fill = PatternFill("solid", fgColor="1F4E78")
         header_font = Font(color="FFFFFF", bold=True)
         missing_icargo_fill = PatternFill("solid", fgColor="FFF2CC")
-        missing_vvi_fill = PatternFill("solid", fgColor="F4CCCC")
+        missing_cs_fill = PatternFill("solid", fgColor="F4CCCC")
 
-        for sheet_name in ("Compare Summary", "AWB Cross Check", "Missing in iCargo", "Missing in VVI"):
+        for sheet_name in ("AWB Cross Check", "CS Data"):
             if sheet_name not in workbook.sheetnames:
                 continue
             worksheet = workbook[sheet_name]
@@ -2124,20 +2184,12 @@ def style_compare_sheets(workbook_path: Path) -> None:
                         status = str(row[status_column - 1].value or "")
                         if status == "Missing in iCargo":
                             fill = missing_icargo_fill
-                        elif status == "Missing in VVI":
-                            fill = missing_vvi_fill
+                        elif status == "Missing in CS":
+                            fill = missing_cs_fill
                         else:
                             continue
                         for cell in row:
                             cell.fill = fill
-            elif sheet_name == "Missing in iCargo":
-                for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row):
-                    for cell in row:
-                        cell.fill = missing_icargo_fill
-            elif sheet_name == "Missing in VVI":
-                for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row):
-                    for cell in row:
-                        cell.fill = missing_vvi_fill
 
             for column_cells in worksheet.columns:
                 header = column_cells[0].value
@@ -2295,12 +2347,12 @@ def add_live_system_comparison(
     workbook_path = Path(workbook_path)
     icargo_df = pd.read_excel(workbook_path, sheet_name="Processed")
     system_df = pd.read_excel(csprod_path)
-    emit(progress_callback, f"VVI rows downloaded: {len(system_df)}", 95)
+    emit(progress_callback, f"CS rows downloaded: {len(system_df)}", 95)
     icargo_compare_df, cancelled_icargo_rows, cancelled_icargo_awbs = filter_cancelled_icargo_bookings(icargo_df)
     if cancelled_icargo_awbs:
         emit(progress_callback, f"Ignoring {len(cancelled_icargo_awbs)} cancelled iCargo AWB(s)", 95)
     system_flight_df = system_df.copy()
-    emit(progress_callback, f"Using all {len(system_flight_df)} VVI row(s) for AWB comparison", 95)
+    emit(progress_callback, f"Using all {len(system_flight_df)} CS row(s) for AWB comparison", 95)
 
     icargo_awbs = dataframe_awb_map(icargo_compare_df)
     for key in cancelled_icargo_awbs:
@@ -2314,56 +2366,49 @@ def add_live_system_comparison(
     missing_in_icargo = sorted(system_keys - icargo_keys)
     missing_in_system = sorted(icargo_keys - system_keys)
 
-    summary_df = pd.DataFrame(
-        [
-            {"Metric": "Flight", "Value": f"{flight_carrier}{flight_number}"},
-            {"Metric": "Flight date", "Value": flight_date},
-            {"Metric": "System query", "Value": CSPROD_QUERY_NAME},
-            {"Metric": "System AWB source", "Value": "VVI column 4"},
-            {"Metric": "iCargo AWBs", "Value": len(icargo_keys)},
-            {"Metric": "Cancelled iCargo rows ignored", "Value": cancelled_icargo_rows},
-            {"Metric": "Cancelled iCargo AWBs ignored", "Value": len(cancelled_icargo_awbs)},
-            {"Metric": "VVI AWBs", "Value": len(system_keys)},
-            {"Metric": "Missing in iCargo", "Value": len(missing_in_icargo)},
-            {"Metric": "Missing in VVI", "Value": len(missing_in_system)},
-        ]
-    )
-    missing_icargo_df = pd.DataFrame([system_awbs[key] for key in missing_in_icargo])
-    missing_system_df = pd.DataFrame([icargo_awbs[key] for key in missing_in_system])
-    icargo_awbs_df = pd.DataFrame({"AWB": sorted(icargo_keys)})
-    system_awbs_df = pd.DataFrame({"AWB": sorted(system_keys)})
-    cross_check_df = pd.DataFrame(
-        [
+    cross_check_rows = []
+    for key in sorted(icargo_keys | system_keys):
+        icargo_chw = row_value_by_column(icargo_awbs.get(key), icargo_df.columns, 10, "Chargeable Weight")
+        system_chw = row_value_by_column(system_awbs.get(key), system_flight_df.columns, 5)
+        cross_check_rows.append(
             {
                 "AWB": key,
                 "In iCargo": "Yes" if key in icargo_keys else "No",
-                "In VVI": "Yes" if key in system_keys else "No",
+                "In CS": "Yes" if key in system_keys else "No",
                 "Status": (
                     "OK"
                     if key in icargo_keys and key in system_keys
                     else "Missing in iCargo"
                     if key not in icargo_keys
-                    else "Missing in VVI"
+                    else "Missing in CS"
                 ),
+                "CHW in iCargo": icargo_chw,
+                "CHW in CS": system_chw,
+                "Diff CHW": chw_difference(icargo_chw, system_chw),
             }
-            for key in sorted(icargo_keys | system_keys)
-        ]
-    )
+        )
+    cross_check_df = pd.DataFrame(cross_check_rows)
 
+    remove_workbook_sheets(
+        workbook_path,
+        (
+            "Compare Summary",
+            "Missing in iCargo",
+            "Missing in VVI",
+            "iCargo AWBs",
+            "VVI AWBs",
+            "VVI Rows",
+        ),
+    )
     with pd.ExcelWriter(workbook_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        summary_df.to_excel(writer, index=False, sheet_name="Compare Summary")
         cross_check_df.to_excel(writer, index=False, sheet_name="AWB Cross Check")
-        missing_icargo_df.to_excel(writer, index=False, sheet_name="Missing in iCargo")
-        missing_system_df.to_excel(writer, index=False, sheet_name="Missing in VVI")
-        icargo_awbs_df.to_excel(writer, index=False, sheet_name="iCargo AWBs")
-        system_awbs_df.to_excel(writer, index=False, sheet_name="VVI AWBs")
-        system_flight_df.to_excel(writer, index=False, sheet_name="VVI Rows")
+        system_flight_df.to_excel(writer, index=False, sheet_name="CS Data")
 
     style_compare_sheets(workbook_path)
 
     emit(
         progress_callback,
-        f"Compare complete: {len(missing_in_icargo)} missing in iCargo, {len(missing_in_system)} missing in VVI",
+        f"Compare complete: {len(missing_in_icargo)} missing in iCargo, {len(missing_in_system)} missing in CS",
         96,
     )
     return {
@@ -2371,6 +2416,8 @@ def add_live_system_comparison(
         "system_awbs": len(system_keys),
         "missing_in_icargo": len(missing_in_icargo),
         "missing_in_system": len(missing_in_system),
+        "cancelled_icargo_rows_ignored": cancelled_icargo_rows,
+        "cancelled_icargo_awbs_ignored": len(cancelled_icargo_awbs),
     }
 
 
