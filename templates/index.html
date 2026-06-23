@@ -131,6 +131,12 @@
             margin-bottom: 10px;
         }
 
+        .action-buttons {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 10px;
+        }
+
         button {
             min-height: 38px;
             border: 1px solid #b9c4d3;
@@ -163,6 +169,18 @@
 
         .primary-btn:hover:not(:disabled) {
             background: #941323;
+        }
+
+        .secondary-btn {
+            width: 100%;
+            min-height: 46px;
+            background: #ffffff;
+            border-color: #b4172a;
+            color: #9d1e2d;
+        }
+
+        .secondary-btn:hover:not(:disabled) {
+            background: #fff4f5;
         }
 
         .download-link {
@@ -417,6 +435,10 @@
                 grid-template-columns: 1fr;
             }
 
+            .action-buttons {
+                grid-template-columns: 1fr;
+            }
+
             .date-grid {
                 grid-template-columns: 1fr;
             }
@@ -467,19 +489,6 @@
                         </div>
                     </div>
 
-                    <div class="form-group">
-                        <label for="originType">Origin type</label>
-                        <select id="originType">
-                            <option value="Airport">Airport</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="checkbox-option">
-                            <input type="checkbox" id="cap142Debug">
-                            <span>CAP142 diagnostic snapshot only</span>
-                        </label>
-                    </div>
                 </div>
 
                 <div class="form-group">
@@ -506,7 +515,10 @@
                     </div>
                 </div>
 
-                <button type="button" class="primary-btn" id="downloadBtn">Start download</button>
+                <div class="action-buttons">
+                    <button type="button" class="primary-btn" id="downloadBtn">Download</button>
+                    <button type="button" class="secondary-btn" id="compareBtn">Download and compare</button>
+                </div>
                 <div id="statusMessage" class="status"></div>
             </section>
 
@@ -708,6 +720,7 @@
 
         function setBusy(isBusy) {
             document.getElementById("downloadBtn").disabled = isBusy;
+            document.getElementById("compareBtn").disabled = isBusy;
             document.querySelectorAll("input, select, #selectAllBtn, #clearBtn").forEach((element) => {
                 element.disabled = isBusy;
             });
@@ -725,7 +738,7 @@
             element.className = "status";
         }
 
-        async function startDownload() {
+        async function startDownload(compareWithSystem = false) {
             if (window.location.protocol === "file:") {
                 showStatus("Open the Railway URL or local Flask URL, not the raw HTML file.", "error");
                 return;
@@ -737,8 +750,14 @@
                 module,
                 airports,
                 startDate: document.getElementById("startDate").value,
-                endDate: document.getElementById("endDate").value
+                endDate: document.getElementById("endDate").value,
+                compareWithSystem
             };
+
+            if (compareWithSystem && !(module === "CAP142" && currentCap142Mode() === "specific_flight")) {
+                showStatus("Download and compare is only available for CAP142 specific flight for now.", "error");
+                return;
+            }
 
             const isOptionalOriginSpecificFlight = module === "CAP142" && currentCap142Mode() === "specific_flight";
             if (!airports.length && !isOptionalOriginSpecificFlight) {
@@ -749,8 +768,7 @@
             if (module === "CAP142") {
                 payload.cap142Mode = currentCap142Mode();
                 payload.awbPrefix = payload.cap142Mode === "specific_flight" ? "" : document.getElementById("awbPrefix").value;
-                payload.originType = document.getElementById("originType").value;
-                payload.cap142Debug = document.getElementById("cap142Debug").checked;
+                payload.originType = "Airport";
 
                 if (payload.cap142Mode === "specific_flight") {
                     payload.flightCarrier = document.getElementById("flightCarrier").value;
@@ -798,7 +816,7 @@
                 activeJobId = data.id;
                 renderJob(data);
                 beginPolling(activeJobId);
-                showStatus("Download job started.", "info");
+                showStatus(compareWithSystem ? "Download and compare job started." : "Download job started.", "info");
             } catch (error) {
                 showStatus(error.message, "error");
                 if (!activeJobId) {
@@ -995,7 +1013,8 @@
         document.getElementById("startDate").addEventListener("change", syncDateLimits);
         document.getElementById("module").addEventListener("change", updateModuleView);
         document.getElementById("cap142Mode").addEventListener("change", updateModuleView);
-        document.getElementById("downloadBtn").addEventListener("click", startDownload);
+        document.getElementById("downloadBtn").addEventListener("click", () => startDownload(false));
+        document.getElementById("compareBtn").addEventListener("click", () => startDownload(true));
 
         initDates();
         initAirports();
@@ -1003,6 +1022,7 @@
         if (window.location.protocol === "file:") {
             showStatus("This is the raw HTML file. Open the Railway URL to run downloads.", "error");
             document.getElementById("downloadBtn").disabled = true;
+            document.getElementById("compareBtn").disabled = true;
         }
     </script>
 </body>
