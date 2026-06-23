@@ -76,11 +76,15 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v29-cap142-blank-origin"
+DOWNLOADER_BUILD_VERSION = "job-api-v31-cap142-vvi-compare"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
 VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
+CSPROD_LOGIN_URL = "https://csprod.gsaforce.com/"
+CSPROD_QUERY_URL = "https://csprod.gsaforce.com/Reports/Query.aspx"
+CSPROD_QUERY_NAME = "VVI"
+CSPROD_REPORT_OPTION = "Booking Details"
 CAP142_PROCESSED_COLUMNS = [
     ("AWB No.", "AWB No."),
     ("Shipment Details", "Shipment Details"),
@@ -923,17 +927,6 @@ def save_debug_snapshot(driver: webdriver.Chrome, debug_dir: Path | None, label:
     except Exception as exc:
         logger.warning("Could not save debug snapshot: %s", exc)
         return []
-
-
-def save_cap142_debug_snapshot(driver: webdriver.Chrome, debug_dir: Path | None, label: str) -> list[Path]:
-    try:
-        enter_cap142_frame(driver, timeout=10)
-        return save_debug_snapshot(driver, debug_dir, label)
-    finally:
-        try:
-            driver.switch_to.default_content()
-        except Exception:
-            pass
 
 
 def cap142_ensure_search_form_visible(
@@ -1908,6 +1901,421 @@ def write_cap142_workbook_with_processed_tab(
     return output_path
 
 
+def required_env_value(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def normalize_awb_key(*parts: object) -> str | None:
+    text = " ".join("" if part is None else str(part) for part in parts).strip()
+    if not text:
+        return None
+
+    match = re.search(r"\b(\d{3})\D+(\d{6,12})\b", text)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}"
+
+    digits = re.sub(r"\D", "", text)
+    if len(digits) >= 10:
+        return f"{digits[:3]}-{digits[3:]}"
+    return None
+
+
+def dataframe_awb_map(df: pd.DataFrame, preferred_column_indexes: Iterable[int] | None = None) -> dict[str, dict]:
+    awbs: dict[str, dict] = {}
+    columns = {str(column).strip().lower(): column for column in df.columns}
+    preferred_columns = []
+    if preferred_column_indexes:
+        all_columns = list(df.columns)
+        for index in preferred_column_indexes:
+            if 0 <= index < len(all_columns):
+                preferred_columns.append(all_columns[index])
+
+    pfx_column = columns.get("bkg_pfx") or columns.get("pfx")
+    awb_column = (
+        columns.get("bkg_awbnmr")
+        or columns.get("awb_no")
+        or columns.get("awb no.")
+        or columns.get("awb no")
+        or columns.get("awb")
+    )
+
+    for _, row in df.iterrows():
+        key = None
+        for preferred_column in preferred_columns:
+            key = normalize_awb_key(row.get(preferred_column))
+            if key:
+                break
+
+        if not key and pfx_column is not None and awb_column is not None:
+            key = normalize_awb_key(row.get(pfx_column), row.get(awb_column))
+        elif not key and awb_column is not None:
+            key = normalize_awb_key(row.get(awb_column))
+        elif not key:
+            key = normalize_awb_key(" ".join(str(value) for value in row.tolist()))
+
+        if key and key not in awbs:
+            awbs[key] = {str(column): row.get(column) for column in df.columns}
+            awbs[key]["AWB"] = key
+    return awbs
+
+
+def parse_compare_date(value: object) -> date | None:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+
+    try:
+        numeric = float(value)
+        if 20000 <= numeric <= 80000:
+            return date(1899, 12, 30) + timedelta(days=int(numeric))
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        parsed = pd.to_datetime(str(value), errors="coerce")
+        if pd.notna(parsed):
+            return parsed.date()
+    except Exception:
+        pass
+    return None
+
+
+def cap142_target_date(value: str) -> date:
+    return datetime.strptime(value.upper(), "%d-%b-%Y").date()
+
+
+def row_matches_flight(row: pd.Series, flight_carrier: str, flight_number: str, flight_date: date) -> bool:
+    carrier = flight_carrier.strip().upper()
+    number = re.sub(r"\D", "", flight_number)
+    values = ["" if pd.isna(value) else str(value) for value in row.tolist()]
+    joined = " ".join(values).upper()
+    compact = re.sub(r"[^A-Z0-9]", "", joined)
+
+    flight_ok = f"{carrier}{number}" in compact or (carrier in compact and number in compact)
+    if not flight_ok:
+        return False
+
+    date_ok = False
+    for column, value in row.items():
+        column_name = str(column).lower()
+        if "date" not in column_name and "flight" not in column_name and "fwd" not in column_name:
+            continue
+        parsed = parse_compare_date(value)
+        if parsed == flight_date:
+            date_ok = True
+            break
+
+    if date_ok:
+        return True
+
+    date_tokens = {
+        flight_date.strftime("%Y-%m-%d").upper(),
+        flight_date.strftime("%d-%b-%Y").upper(),
+        flight_date.strftime("%d-%b-%y").upper(),
+        flight_date.strftime("%d%b%Y").upper(),
+        flight_date.strftime("%d%b%y").upper(),
+        flight_date.strftime("%d/%m/%Y").upper(),
+        flight_date.strftime("%m/%d/%Y").upper(),
+    }
+    compact_date_text = re.sub(r"[^A-Z0-9/\\-]", "", joined)
+    return any(token in joined or token in compact_date_text for token in date_tokens)
+
+
+def filter_csprod_flight_rows(
+    df: pd.DataFrame,
+    flight_carrier: str,
+    flight_number: str,
+    flight_date_value: str,
+) -> pd.DataFrame:
+    target_date = cap142_target_date(flight_date_value)
+    matches = df.apply(
+        lambda row: row_matches_flight(row, flight_carrier, flight_number, target_date),
+        axis=1,
+    )
+    return df.loc[matches].copy()
+
+
+def style_compare_sheets(workbook_path: Path) -> None:
+    try:
+        from openpyxl import load_workbook
+        from openpyxl.styles import Font, PatternFill
+    except ImportError:
+        logger.info("openpyxl styling is unavailable; comparison tabs were still written")
+        return
+
+    try:
+        workbook = load_workbook(workbook_path)
+        header_fill = PatternFill("solid", fgColor="1F4E78")
+        header_font = Font(color="FFFFFF", bold=True)
+        missing_icargo_fill = PatternFill("solid", fgColor="FFF2CC")
+        missing_vvi_fill = PatternFill("solid", fgColor="F4CCCC")
+
+        for sheet_name in ("Compare Summary", "AWB Cross Check", "Missing in iCargo", "Missing in VVI"):
+            if sheet_name not in workbook.sheetnames:
+                continue
+            worksheet = workbook[sheet_name]
+            worksheet.freeze_panes = "A2"
+            for cell in worksheet[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+
+            if sheet_name == "AWB Cross Check":
+                status_column = None
+                for cell in worksheet[1]:
+                    if str(cell.value).strip().lower() == "status":
+                        status_column = cell.column
+                        break
+                if status_column:
+                    for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row):
+                        status = str(row[status_column - 1].value or "")
+                        if status == "Missing in iCargo":
+                            fill = missing_icargo_fill
+                        elif status == "Missing in VVI":
+                            fill = missing_vvi_fill
+                        else:
+                            continue
+                        for cell in row:
+                            cell.fill = fill
+            elif sheet_name == "Missing in iCargo":
+                for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row):
+                    for cell in row:
+                        cell.fill = missing_icargo_fill
+            elif sheet_name == "Missing in VVI":
+                for row in worksheet.iter_rows(min_row=2, max_row=worksheet.max_row):
+                    for cell in row:
+                        cell.fill = missing_vvi_fill
+
+            for column_cells in worksheet.columns:
+                header = column_cells[0].value
+                max_length = len(str(header or ""))
+                for cell in column_cells[1:200]:
+                    if cell.value is not None:
+                        max_length = max(max_length, len(str(cell.value)))
+                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, 12), 45)
+
+        workbook.save(workbook_path)
+    except Exception as exc:
+        logger.warning("Could not style comparison sheets: %s", exc)
+
+
+def download_csprod_booking_details(
+    download_dir: Path,
+    progress_callback: ProgressCallback | None = None,
+    cancel_callback: CancelCallback | None = None,
+) -> Path:
+    username = required_env_value("CSPROD_USERNAME")
+    password = required_env_value("CSPROD_PASSWORD")
+
+    try:
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("Playwright is not installed. Redeploy after updating requirements.txt.") from exc
+
+    download_dir.mkdir(parents=True, exist_ok=True)
+    output_path = download_dir / f"csprod_vvi_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    chrome_binary = find_chrome_binary()
+
+    def wait_for_page(page, state: str = "domcontentloaded", timeout: int = 60_000) -> None:
+        try:
+            page.wait_for_load_state(state, timeout=timeout)
+        except PlaywrightTimeoutError:
+            logger.info("Continuing after CSPROD %s wait timed out", state)
+
+    with sync_playwright() as playwright:
+        launch_args = {
+            "headless": True,
+            "args": [
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
+        }
+        if chrome_binary:
+            launch_args["executable_path"] = chrome_binary
+
+        browser = playwright.chromium.launch(**launch_args)
+        context = browser.new_context(
+            accept_downloads=True,
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/147.0.0.0 Safari/537.36"
+            ),
+        )
+        context.set_default_timeout(60_000)
+        page = context.new_page()
+
+        try:
+            check_cancelled(cancel_callback)
+            emit(progress_callback, "Opening live system login", 89)
+            page.goto(CSPROD_LOGIN_URL, wait_until="domcontentloaded")
+
+            emit(progress_callback, "Logging in to live system", 89)
+            user_field = page.locator(
+                'input[name="username"], input[name="user"], input[name="login"], '
+                'input[type="text"]:visible, input[type="email"]:visible'
+            ).first
+            pass_field = page.locator('input[type="password"]:visible').first
+            user_field.fill(username)
+            pass_field.fill(password)
+
+            login_btn = page.get_by_role("button", name=re.compile(r"log", re.IGNORECASE))
+            if login_btn.count() > 0:
+                login_btn.first.click()
+            else:
+                pass_field.press("Enter")
+            wait_for_page(page)
+            page.wait_for_timeout(1500)
+
+            check_cancelled(cancel_callback)
+            emit(progress_callback, "Opening live system report query", 90)
+            page.goto(CSPROD_QUERY_URL, wait_until="domcontentloaded", timeout=60_000)
+            page.wait_for_timeout(1500)
+
+            emit(progress_callback, f"Selecting {CSPROD_QUERY_NAME}", 90)
+            selected = False
+            for select in page.locator("select").all():
+                try:
+                    select.select_option(label=CSPROD_QUERY_NAME)
+                    selected = True
+                    break
+                except Exception:
+                    continue
+            if not selected:
+                page.locator("button, .dropdown, [role='combobox']").first.click()
+                page.get_by_text(CSPROD_QUERY_NAME, exact=True).first.click()
+
+            wait_for_page(page)
+            page.wait_for_timeout(1500)
+
+            emit(progress_callback, f"Selecting {CSPROD_REPORT_OPTION}", 91)
+            radio = page.locator("label", has_text=CSPROD_REPORT_OPTION)
+            if radio.count() > 0:
+                radio.first.click()
+            else:
+                page.locator("input[type='radio']").nth(1).click()
+            page.wait_for_timeout(1000)
+
+            check_cancelled(cancel_callback)
+            emit(progress_callback, "Running live system report", 91)
+            page.get_by_role("button", name=re.compile(r"search", re.IGNORECASE)).first.click()
+            wait_for_page(page)
+            page.wait_for_timeout(3000)
+
+            excel_button = page.get_by_role("button", name=re.compile(r"excel", re.IGNORECASE)).first
+            excel_button.wait_for(state="visible", timeout=60_000)
+
+            for attempt in range(1, 3):
+                check_cancelled(cancel_callback)
+                try:
+                    emit(progress_callback, f"Downloading VVI Excel ({attempt}/2)", 92)
+                    with page.expect_download(timeout=600_000) as download_info:
+                        excel_button.evaluate("button => button.click()")
+                    download = download_info.value
+                    download.save_as(str(output_path))
+                    emit(progress_callback, "VVI Excel downloaded", 94)
+                    return output_path
+                except PlaywrightTimeoutError:
+                    if attempt == 2:
+                        raise
+                    page.wait_for_timeout(10_000)
+        finally:
+            context.close()
+            browser.close()
+
+    return output_path
+
+
+def add_live_system_comparison(
+    workbook_path: Path,
+    csprod_path: Path,
+    *,
+    flight_carrier: str,
+    flight_number: str,
+    flight_date: str,
+    progress_callback: ProgressCallback | None = None,
+) -> dict:
+    emit(progress_callback, "Comparing iCargo AWBs with live system", 95)
+    workbook_path = Path(workbook_path)
+    icargo_df = pd.read_excel(workbook_path, sheet_name="Processed")
+    system_df = pd.read_excel(csprod_path)
+    system_flight_df = filter_csprod_flight_rows(system_df, flight_carrier, flight_number, flight_date)
+    emit(progress_callback, f"VVI rows matched for this flight: {len(system_flight_df)}", 95)
+
+    icargo_awbs = dataframe_awb_map(icargo_df)
+    system_awbs = dataframe_awb_map(system_flight_df, preferred_column_indexes=[3])
+    icargo_keys = set(icargo_awbs)
+    system_keys = set(system_awbs)
+
+    missing_in_icargo = sorted(system_keys - icargo_keys)
+    missing_in_system = sorted(icargo_keys - system_keys)
+
+    summary_df = pd.DataFrame(
+        [
+            {"Metric": "Flight", "Value": f"{flight_carrier}{flight_number}"},
+            {"Metric": "Flight date", "Value": flight_date},
+            {"Metric": "System query", "Value": CSPROD_QUERY_NAME},
+            {"Metric": "System AWB source", "Value": "VVI column 4"},
+            {"Metric": "iCargo AWBs", "Value": len(icargo_keys)},
+            {"Metric": "VVI AWBs", "Value": len(system_keys)},
+            {"Metric": "Missing in iCargo", "Value": len(missing_in_icargo)},
+            {"Metric": "Missing in VVI", "Value": len(missing_in_system)},
+        ]
+    )
+    missing_icargo_df = pd.DataFrame([system_awbs[key] for key in missing_in_icargo])
+    missing_system_df = pd.DataFrame([icargo_awbs[key] for key in missing_in_system])
+    icargo_awbs_df = pd.DataFrame({"AWB": sorted(icargo_keys)})
+    system_awbs_df = pd.DataFrame({"AWB": sorted(system_keys)})
+    cross_check_df = pd.DataFrame(
+        [
+            {
+                "AWB": key,
+                "In iCargo": "Yes" if key in icargo_keys else "No",
+                "In VVI": "Yes" if key in system_keys else "No",
+                "Status": (
+                    "OK"
+                    if key in icargo_keys and key in system_keys
+                    else "Missing in iCargo"
+                    if key not in icargo_keys
+                    else "Missing in VVI"
+                ),
+            }
+            for key in sorted(icargo_keys | system_keys)
+        ]
+    )
+
+    with pd.ExcelWriter(workbook_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+        summary_df.to_excel(writer, index=False, sheet_name="Compare Summary")
+        cross_check_df.to_excel(writer, index=False, sheet_name="AWB Cross Check")
+        missing_icargo_df.to_excel(writer, index=False, sheet_name="Missing in iCargo")
+        missing_system_df.to_excel(writer, index=False, sheet_name="Missing in VVI")
+        icargo_awbs_df.to_excel(writer, index=False, sheet_name="iCargo AWBs")
+        system_awbs_df.to_excel(writer, index=False, sheet_name="VVI AWBs")
+        system_flight_df.to_excel(writer, index=False, sheet_name="VVI Rows")
+
+    style_compare_sheets(workbook_path)
+
+    emit(
+        progress_callback,
+        f"Compare complete: {len(missing_in_icargo)} missing in iCargo, {len(missing_in_system)} missing in VVI",
+        96,
+    )
+    return {
+        "icargo_awbs": len(icargo_keys),
+        "system_awbs": len(system_keys),
+        "missing_in_icargo": len(missing_in_icargo),
+        "missing_in_system": len(missing_in_system),
+    }
+
+
 def upload_to_dropbox(config: DownloaderConfig, file_path: str | Path) -> bool:
     if not DROPBOX_AVAILABLE:
         logger.warning("Dropbox SDK is not installed; skipping upload")
@@ -1944,7 +2352,7 @@ def run_cap142_workflow(
     flight_number: str | None = None,
     awb_prefix: str = "729",
     origin_type: str = "Airport",
-    cap142_debug: bool = False,
+    compare_with_system: bool = False,
 ) -> dict:
     config = DownloaderConfig.from_env(download_dir=download_dir)
     config.validate()
@@ -1980,6 +2388,7 @@ def run_cap142_workflow(
     successful_downloads = 0
     failed_downloads = 0
     downloaded_files = []
+    comparison_result = None
 
     try:
         check_cancelled(cancel_callback)
@@ -1992,8 +2401,10 @@ def run_cap142_workflow(
             emit(progress_callback, f"Booking date range: {icargo_start_date} to {icargo_end_date}", 5)
         origin_summary = ", ".join(origin_display_name(origin) for origin in selected_origins)
         emit(progress_callback, f"Origins selected: {origin_summary}", 6)
-        if cap142_debug:
-            emit(progress_callback, "CAP142 diagnostic mode: will stop after saving a screenshot", 7)
+        if compare_with_system:
+            if mode != "specific_flight":
+                raise ValueError("Download and compare is only available for CAP142 specific flight for now.")
+            emit(progress_callback, "Compare requested: will download live system data after iCargo", 8)
 
         driver = prepare_icargo_session(
             config=config,
@@ -2044,18 +2455,6 @@ def run_cap142_workflow(
                 ):
                     last_failure = "failed to set CAP142 search fields"
                     continue
-
-                if cap142_debug:
-                    saved_files = save_cap142_debug_snapshot(
-                        driver,
-                        debug_dir,
-                        f"CAP142_{origin_code}_after_fields",
-                    )
-                    if saved_files:
-                        emit(progress_callback, f"{origin_label}: diagnostic snapshot saved", base_progress + 2)
-                    else:
-                        emit(progress_callback, f"{origin_label}: diagnostic snapshot could not be saved", base_progress + 2)
-                    raise RuntimeError("CAP142 diagnostic snapshot saved. No download was attempted.")
 
                 emit(progress_callback, f"{origin_label}: running CAP142 query", base_progress + 1)
                 if not cap142_click_list(
@@ -2130,8 +2529,24 @@ def run_cap142_workflow(
             default_origin=selected_origins[0] if len(selected_origins) == 1 and selected_origins[0] else None,
         )
 
+        if compare_with_system:
+            check_cancelled(cancel_callback)
+            csprod_file = download_csprod_booking_details(
+                config.download_dir,
+                progress_callback=progress_callback,
+                cancel_callback=cancel_callback,
+            )
+            comparison_result = add_live_system_comparison(
+                merged_file,
+                csprod_file,
+                flight_carrier=flight_carrier,
+                flight_number=flight_number,
+                flight_date=icargo_start_date,
+                progress_callback=progress_callback,
+            )
+
         if upload_dropbox:
-            emit(progress_callback, "Uploading CAP142 file to Dropbox", 92)
+            emit(progress_callback, "Uploading CAP142 file to Dropbox", 97)
             upload_to_dropbox(config, merged_file)
 
         result = {
@@ -2143,6 +2558,7 @@ def run_cap142_workflow(
             "end_date": icargo_end_date,
             "module": "CAP142",
             "cap142_mode": mode,
+            "comparison": comparison_result,
         }
 
         if send_email:
@@ -2250,7 +2666,7 @@ def run_download_workflow(
     flight_number: str | None = None,
     awb_prefix: str = "729",
     origin_type: str = "Airport",
-    cap142_debug: bool = False,
+    compare_with_system: bool = False,
 ) -> dict:
     module_code = (module or "TRF007").strip().upper()
     if module_code == "CAP142":
@@ -2268,7 +2684,7 @@ def run_download_workflow(
             flight_number=flight_number,
             awb_prefix=awb_prefix,
             origin_type=origin_type,
-            cap142_debug=cap142_debug,
+            compare_with_system=compare_with_system,
         )
     if module_code != "TRF007":
         raise ValueError(f"Unsupported module: {module}")

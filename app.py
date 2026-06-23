@@ -65,7 +65,7 @@ JOBS: dict[str, dict] = {}
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v18-cap142-blank-origin"
+APP_BUILD_VERSION = "job-api-v21-cap142-vvi-compare"
 
 
 def now_iso() -> str:
@@ -324,6 +324,7 @@ def diagnostics():
                 "importOk": True,
                 "path": getattr(downloader, "__file__", None),
                 "buildVersion": getattr(downloader, "DOWNLOADER_BUILD_VERSION", "missing"),
+                "compareQuery": getattr(downloader, "CSPROD_QUERY_NAME", "missing"),
                 "hasRunDownloadWorkflow": callable(getattr(downloader, "run_download_workflow", None)),
             }
         )
@@ -339,6 +340,8 @@ def diagnostics():
                 "hasAviancaEmail": bool(os.getenv("AVIANCA_EMAIL")),
                 "hasGmailEmail": bool(os.getenv("GMAIL_EMAIL")),
                 "hasGmailAppPassword": bool(os.getenv("GMAIL_APP_PASSWORD") or os.getenv("GMAIL_PASSWORD")),
+                "hasCsprodUsername": bool(os.getenv("CSPROD_USERNAME")),
+                "hasCsprodPassword": bool(os.getenv("CSPROD_PASSWORD")),
             },
             "chrome": binary_diagnostics(),
         }
@@ -395,6 +398,7 @@ def start_download():
         end_date = data.get("endDate")
         cap142_options = {}
         cap142_mode = str(data.get("cap142Mode", "booking_period")).strip().lower()
+        compare_with_system = bool(data.get("compareWithSystem"))
 
         if module not in {"TRF007", "CAP142"}:
             return jsonify({"error": "Only TRF007 and CAP142 are currently supported"}), 400
@@ -411,6 +415,9 @@ def start_download():
             return jsonify({"error": f"Invalid airports: {', '.join(invalid_airports)}"}), 400
 
         if module == "CAP142":
+            if compare_with_system and cap142_mode != "specific_flight":
+                return jsonify({"error": "Download and compare is only available for CAP142 specific flight for now."}), 400
+
             if cap142_mode == "specific_flight":
                 awb_prefix = ""
                 flight_carrier = str(data.get("flightCarrier", "QT")).strip().upper() or "QT"
@@ -435,8 +442,10 @@ def start_download():
                 "flight_number": flight_number,
                 "awb_prefix": awb_prefix,
                 "origin_type": "Airport",
-                "cap142_debug": bool(data.get("cap142Debug")),
+                "compare_with_system": compare_with_system,
             }
+        elif compare_with_system:
+            return jsonify({"error": "Download and compare is only available for CAP142 specific flight for now."}), 400
 
         start = parse_iso_date(start_date, "startDate")
         end = parse_iso_date(end_date, "endDate")
