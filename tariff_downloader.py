@@ -76,10 +76,11 @@ DEFAULT_AIRPORTS = [
 MAX_RANGE_DAYS = 15
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
-DOWNLOADER_BUILD_VERSION = "job-api-v33-cap142-vvi-awb-only"
+DOWNLOADER_BUILD_VERSION = "job-api-v34-cap142-country-origin"
 EXPORT_FILE_SUFFIXES = (".xlsx", ".xls")
 EXPORT_SETTLE_SECONDS = 5
 CAP142_MODES = {"specific_flight", "booking_period"}
+CAP142_COUNTRY_ORIGINS = {"CN", "HK", "TW", "JP", "KR", "VN", "ID"}
 VERIFICATION_SUBJECT_FRAGMENT = "account verification code"
 CSPROD_LOGIN_URL = "https://csprod.gsaforce.com/"
 CSPROD_QUERY_URL = "https://csprod.gsaforce.com/Reports/Query.aspx"
@@ -195,7 +196,30 @@ def normalize_airports(airports: Iterable[str] | None) -> list[str]:
     return normalized
 
 
-def normalize_cap142_origins(origins: Iterable[str] | None, mode: str) -> list[str]:
+def normalize_cap142_origins(origins: Iterable[str] | None, mode: str, origin_type: str = "Airport") -> list[str]:
+    origin_type_key = (origin_type or "Airport").strip().lower()
+    if origin_type_key not in {"airport", "country"}:
+        raise ValueError("CAP142 origin type must be Airport or Country")
+
+    if origin_type_key == "country":
+        normalized = []
+        for origin in origins or []:
+            code = origin.strip().upper()
+            if not code:
+                continue
+            if not re.fullmatch(r"[A-Z]{2}", code) or code not in CAP142_COUNTRY_ORIGINS:
+                raise ValueError(f"Invalid CAP142 country code: {origin}")
+            normalized.append(code)
+
+        if mode == "specific_flight":
+            if len(normalized) > 1:
+                raise ValueError("Specific flight download can use one origin or no origin filter")
+            return normalized or [""]
+
+        if not normalized:
+            raise ValueError("At least one country is required")
+        return normalized
+
     if mode != "specific_flight":
         return normalize_airports(origins)
 
@@ -2368,10 +2392,11 @@ def run_cap142_workflow(
     if mode not in CAP142_MODES:
         raise ValueError("CAP142 mode must be specific_flight or booking_period")
 
-    selected_origins = normalize_cap142_origins(airports, mode)
-
-    if origin_type.strip().lower() != "airport":
-        raise ValueError("CAP142 country-origin automation is not enabled yet. Use Airport for now.")
+    origin_type_key = (origin_type or "Airport").strip().lower()
+    if origin_type_key not in {"airport", "country"}:
+        raise ValueError("CAP142 origin type must be Airport or Country")
+    origin_type = "Country" if origin_type_key == "country" else "Airport"
+    selected_origins = normalize_cap142_origins(airports, mode, origin_type)
 
     if mode == "specific_flight":
         awb_prefix = ""
@@ -2406,6 +2431,7 @@ def run_cap142_workflow(
         else:
             emit(progress_callback, f"Mode: booking period for AWB prefix {awb_prefix}", 4)
             emit(progress_callback, f"Booking date range: {icargo_start_date} to {icargo_end_date}", 5)
+        emit(progress_callback, f"Origin type: {origin_type}", 6)
         origin_summary = ", ".join(origin_display_name(origin) for origin in selected_origins)
         emit(progress_callback, f"Origins selected: {origin_summary}", 6)
         if compare_with_system:
@@ -2565,6 +2591,7 @@ def run_cap142_workflow(
             "end_date": icargo_end_date,
             "module": "CAP142",
             "cap142_mode": mode,
+            "origin_type": origin_type,
             "comparison": comparison_result,
         }
 

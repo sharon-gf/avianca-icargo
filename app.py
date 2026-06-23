@@ -46,6 +46,7 @@ DEFAULT_AIRPORTS = [
     "LHE",
     "MIA",
 ]
+CAP142_COUNTRY_ORIGINS = {"CN", "HK", "TW", "JP", "KR", "VN", "ID"}
 MAX_RANGE_DAYS = 15
 
 
@@ -65,7 +66,7 @@ JOBS: dict[str, dict] = {}
 # sessions at once.
 EXECUTOR = ThreadPoolExecutor(max_workers=1)
 CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v23-cap142-vvi-awb-only"
+APP_BUILD_VERSION = "job-api-v24-cap142-country-origin"
 
 
 def now_iso() -> str:
@@ -405,14 +406,26 @@ def start_download():
         if module == "CAP142" and cap142_mode not in {"specific_flight", "booking_period"}:
             return jsonify({"error": "CAP142 mode must be booking_period or specific_flight"}), 400
 
+        origin_type = "Airport"
+        if module == "CAP142":
+            origin_type_key = str(data.get("originType", "Airport")).strip().lower() or "airport"
+            if origin_type_key not in {"airport", "country"}:
+                return jsonify({"error": "CAP142 origin type must be Airport or Country"}), 400
+            origin_type = "Country" if origin_type_key == "country" else "Airport"
+
         origin_is_optional = module == "CAP142" and cap142_mode == "specific_flight"
         if not airports and not origin_is_optional:
             return jsonify({"error": "No origins selected"}), 400
 
-        allowed_airports = set(DEFAULT_AIRPORTS)
-        invalid_airports = sorted(set(airports) - allowed_airports)
-        if invalid_airports:
-            return jsonify({"error": f"Invalid airports: {', '.join(invalid_airports)}"}), 400
+        if module == "CAP142" and origin_type == "Country":
+            invalid_origins = sorted(set(airports) - CAP142_COUNTRY_ORIGINS)
+            if invalid_origins:
+                return jsonify({"error": f"Invalid CAP142 country origins: {', '.join(invalid_origins)}"}), 400
+        else:
+            allowed_airports = set(DEFAULT_AIRPORTS)
+            invalid_airports = sorted(set(airports) - allowed_airports)
+            if invalid_airports:
+                return jsonify({"error": f"Invalid airports: {', '.join(invalid_airports)}"}), 400
 
         if module == "CAP142":
             if compare_with_system and cap142_mode != "specific_flight":
@@ -426,10 +439,6 @@ def start_download():
                 awb_prefix = re.sub(r"\D", "", str(data.get("awbPrefix", "729"))) or "729"
                 flight_carrier = ""
                 flight_number = ""
-            origin_type = str(data.get("originType", "Airport")).strip() or "Airport"
-
-            if origin_type.lower() != "airport":
-                return jsonify({"error": "CAP142 country origin is not automated yet. Please use Airport."}), 400
             if cap142_mode == "specific_flight":
                 if len(airports) > 1:
                     return jsonify({"error": "Specific flight mode can use one origin or no origin filter"}), 400
@@ -441,7 +450,7 @@ def start_download():
                 "flight_carrier": flight_carrier,
                 "flight_number": flight_number,
                 "awb_prefix": awb_prefix,
-                "origin_type": "Airport",
+                "origin_type": origin_type,
                 "compare_with_system": compare_with_system,
             }
         elif compare_with_system:
