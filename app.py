@@ -45,6 +45,7 @@ DEFAULT_AIRPORTS = [
     "KIX",
     "LHE",
     "MIA",
+    "SDQ",
 ]
 CAP142_COUNTRY_ORIGINS = {"CN", "HK", "TW", "JP", "KR", "VN", "ID"}
 MAX_RANGE_DAYS = 15

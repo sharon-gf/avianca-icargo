@@ -71,6 +71,7 @@ DEFAULT_AIRPORTS = [
     "KIX",
     "LHE",
     "MIA",
+    "SDQ",
 ]
 
 MAX_RANGE_DAYS = 15
