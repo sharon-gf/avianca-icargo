@@ -60,14 +60,20 @@ TEMP_DIR = Path(os.getenv("JOB_ROOT", tempfile.gettempdir())) / "avianca_downloa
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 JOB_TTL_HOURS = int(os.getenv("JOB_TTL_HOURS", "6"))
+JOB_STALE_MINUTES = int(os.getenv("JOB_STALE_MINUTES", "20"))
 JOB_LOCK = threading.Lock()
 JOBS: dict[str, dict] = {}
 
+
 # Use one worker because the same iCargo/Gmail login should not run multiple MFA
-# sessions at once.
-EXECUTOR = ThreadPoolExecutor(max_workers=1)
+# sessions at once. The executor can be replaced if Selenium gets wedged.
+def create_job_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=1)
+
+
+EXECUTOR = create_job_executor()
 CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v24-cap142-country-origin"
+APP_BUILD_VERSION = "job-api-v25-stuck-job-recovery"
 
 
 def now_iso() -> str:
@@ -90,23 +96,39 @@ def parse_iso_date(value: str, field_name: str) -> datetime.date:
         raise ValueError(f"{field_name} must be in YYYY-MM-DD format") from exc
 
 
+def parse_job_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
 def add_job_log(job_id: str, message: str, progress: int | None = None) -> None:
     with JOB_LOCK:
         job = JOBS.get(job_id)
         if not job:
             return
-        timestamp = datetime.now(timezone.utc)
-        job["logs"].append(
-            {
-                "time": timestamp.strftime("%H:%M:%S"),
-                "timeUtc": timestamp.isoformat(),
-                "message": message,
-            }
-        )
-        job["logs"] = job["logs"][-300:]
+        append_job_log_locked(job, message)
         if progress is not None:
             job["progress"] = max(0, min(100, int(progress)))
         job["updated_at"] = now_iso()
+
+
+def append_job_log_locked(job: dict, message: str) -> None:
+    timestamp = datetime.now(timezone.utc)
+    job["logs"].append(
+        {
+            "time": timestamp.strftime("%H:%M:%S"),
+            "timeUtc": timestamp.isoformat(),
+            "message": message,
+        }
+    )
+    job["logs"] = job["logs"][-300:]
 
 
 def public_job(job: dict) -> dict:
@@ -126,6 +148,7 @@ def public_job(job: dict) -> dict:
         "result": job.get("result"),
         "debugFiles": public_debug_files(job),
         "cancelRequested": bool(job.get("cancel_requested")),
+        "recoveredAt": job.get("recovered_at"),
     }
     if job["status"] == "completed":
         response["downloadUrl"] = f"/api/jobs/{job['id']}/file"
@@ -155,6 +178,90 @@ def find_active_job_locked() -> dict | None:
         if job["status"] in {"queued", "running", "cancelling"}:
             return job
     return None
+
+
+def is_job_stale_locked(job: dict) -> bool:
+    if job["status"] not in {"queued", "running", "cancelling"}:
+        return False
+    updated_at = parse_job_timestamp(job.get("updated_at"))
+    if not updated_at:
+        return False
+    return datetime.now(timezone.utc) - updated_at >= timedelta(minutes=JOB_STALE_MINUTES)
+
+
+def should_kill_browser_processes() -> bool:
+    return env_flag("FORCE_BROWSER_PROCESS_CLEANUP") or any(name.startswith("RAILWAY_") for name in os.environ)
+
+
+def kill_orphan_browser_processes() -> list[str]:
+    if not should_kill_browser_processes():
+        return ["Browser process cleanup skipped outside Railway"]
+
+    results = []
+    for pattern in ("chromedriver", "chromium", "chrome"):
+        try:
+            result = subprocess.run(
+                ["pkill", "-f", pattern],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                results.append(f"Stopped processes matching {pattern}")
+            elif result.returncode == 1:
+                results.append(f"No processes matching {pattern}")
+            else:
+                output = (result.stderr or result.stdout or "unknown error").strip()
+                results.append(f"Could not stop {pattern}: {output}")
+        except Exception as exc:
+            results.append(f"Could not stop {pattern}: {exc}")
+    return results
+
+
+def recover_jobs(reason: str, force: bool = False) -> dict:
+    global EXECUTOR
+
+    recovered_jobs = []
+    old_executor = None
+    recovery_time = now_iso()
+
+    with JOB_LOCK:
+        for job in JOBS.values():
+            if job["status"] not in {"queued", "running", "cancelling"}:
+                continue
+            if not force and not is_job_stale_locked(job):
+                continue
+
+            job["cancel_requested"] = True
+            job["cancel_event"].set()
+            future = job.get("future")
+            if future:
+                future.cancel()
+            job["status"] = "failed"
+            job["error"] = reason
+            job["recovered_at"] = recovery_time
+            job["updated_at"] = recovery_time
+            append_job_log_locked(job, f"Recovery triggered: {reason}")
+            recovered_jobs.append(job["id"])
+
+        if recovered_jobs:
+            old_executor = EXECUTOR
+            EXECUTOR = create_job_executor()
+
+    process_cleanup = []
+    if recovered_jobs:
+        logger.warning("Recovered stuck jobs %s: %s", recovered_jobs, reason)
+        if old_executor:
+            old_executor.shutdown(wait=False, cancel_futures=True)
+        process_cleanup = kill_orphan_browser_processes()
+
+    return {
+        "recovered": bool(recovered_jobs),
+        "jobIds": recovered_jobs,
+        "reason": reason,
+        "processCleanup": process_cleanup,
+        "staleAfterMinutes": JOB_STALE_MINUTES,
+    }
 
 
 def cleanup_old_jobs() -> None:
@@ -251,6 +358,8 @@ def run_job(job_id: str) -> None:
 
         with JOB_LOCK:
             job = JOBS[job_id]
+            if job.get("recovered_at"):
+                return
             if job.get("cancel_requested"):
                 job["status"] = "cancelled"
                 job["updated_at"] = now_iso()
@@ -272,6 +381,8 @@ def run_job(job_id: str) -> None:
         logger.exception("Job %s failed", job_id)
         with JOB_LOCK:
             job = JOBS[job_id]
+            if job.get("recovered_at"):
+                return
             if job.get("cancel_requested"):
                 job["status"] = "cancelled"
                 job["error"] = None
@@ -292,10 +403,21 @@ def index():
 
 @app.route("/api/status")
 def status():
+    recovery = recover_jobs(
+        f"Job had no progress for {JOB_STALE_MINUTES} minutes",
+        force=False,
+    )
     with JOB_LOCK:
         active_job = find_active_job_locked()
         active_job_id = active_job["id"] if active_job else None
-    return jsonify({"status": "ok", "timestamp": now_iso(), "activeJobId": active_job_id})
+    return jsonify(
+        {
+            "status": "ok",
+            "timestamp": now_iso(),
+            "activeJobId": active_job_id,
+            "recovery": recovery,
+        }
+    )
 
 
 @app.route("/api/version")
@@ -344,6 +466,9 @@ def diagnostics():
                 "hasGmailAppPassword": bool(os.getenv("GMAIL_APP_PASSWORD") or os.getenv("GMAIL_PASSWORD")),
                 "hasCsprodUsername": bool(os.getenv("CSPROD_USERNAME")),
                 "hasCsprodPassword": bool(os.getenv("CSPROD_PASSWORD")),
+                "jobStaleMinutes": JOB_STALE_MINUTES,
+                "browserCleanupEnabled": should_kill_browser_processes(),
+                "hasAdminRecoveryToken": bool(os.getenv("ADMIN_RECOVERY_TOKEN")),
             },
             "chrome": binary_diagnostics(),
         }
@@ -382,9 +507,36 @@ def registered_routes() -> list[str]:
     return sorted(rule.rule for rule in app.url_map.iter_rules())
 
 
+def recovery_request_is_authorized() -> bool:
+    expected_token = os.getenv("ADMIN_RECOVERY_TOKEN")
+    if not expected_token:
+        return True
+
+    provided_token = request.headers.get("X-Recovery-Token")
+    if not provided_token:
+        data = request.get_json(silent=True) or {}
+        provided_token = data.get("token")
+    return provided_token == expected_token
+
+
+@app.route("/api/admin/recover", methods=["POST"])
+def admin_recover():
+    if not recovery_request_is_authorized():
+        return jsonify({"error": "Recovery token is invalid"}), 403
+
+    data = request.get_json(silent=True) or {}
+    reason = str(data.get("reason") or "Manual recovery requested").strip()
+    recovery = recover_jobs(reason, force=True)
+    return jsonify(recovery)
+
+
 @app.route("/api/download", methods=["POST"])
 def start_download():
     cleanup_old_jobs()
+    recover_jobs(
+        f"Previous job had no progress for {JOB_STALE_MINUTES} minutes",
+        force=False,
+    )
 
     try:
         data = request.get_json(silent=True) or {}
@@ -502,6 +654,7 @@ def start_download():
                 "result": None,
                 "error": None,
                 "cancel_requested": False,
+                "recovered_at": None,
                 "cancel_event": cancel_event,
                 "future": None,
             }
@@ -520,6 +673,10 @@ def start_download():
 
 @app.route("/api/jobs/<job_id>")
 def get_job(job_id: str):
+    recover_jobs(
+        f"Job had no progress for {JOB_STALE_MINUTES} minutes",
+        force=False,
+    )
     with JOB_LOCK:
         job = JOBS.get(job_id)
         if not job:
