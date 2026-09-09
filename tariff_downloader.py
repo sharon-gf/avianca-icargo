@@ -53,6 +53,7 @@ DEFAULT_AIRPORTS = [
     "ISB",
     "XMN",
     "CGK",
+    "SUB",
     "ICN",
     "TPE",
     "CGO",
