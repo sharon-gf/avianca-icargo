@@ -50,6 +50,9 @@ DEFAULT_AIRPORTS = [
 ]
 CAP142_COUNTRY_ORIGINS = {"CN", "HK", "TW", "JP", "KR", "VN", "ID"}
 MAX_RANGE_DAYS = 15
+# TRF007 accepts up to 30 days; tariff_downloader splits them into 15-day
+# iCargo queries and merges the exports. CAP142 keeps the 15-day limit.
+TRF007_MAX_RANGE_DAYS = 30
 
 
 logging.basicConfig(level=logging.INFO)
@@ -73,8 +76,8 @@ def create_job_executor() -> ThreadPoolExecutor:
 
 
 EXECUTOR = create_job_executor()
-CLIENT_VERSION = "job-api-v2"
-APP_BUILD_VERSION = "job-api-v25-stuck-job-recovery"
+CLIENT_VERSION = "job-api-v3"
+APP_BUILD_VERSION = "job-api-v26-trf007-30-days"
 
 
 def now_iso() -> str:
@@ -615,8 +618,9 @@ def start_download():
         days = (end - start).days
         if days < 0:
             return jsonify({"error": "End date must be on or after start date"}), 400
-        if days > MAX_RANGE_DAYS:
-            return jsonify({"error": f"Date range cannot exceed {MAX_RANGE_DAYS} days"}), 400
+        max_range_days = TRF007_MAX_RANGE_DAYS if module == "TRF007" else MAX_RANGE_DAYS
+        if days > max_range_days:
+            return jsonify({"error": f"Date range cannot exceed {max_range_days} days"}), 400
 
         with JOB_LOCK:
             active_job = find_active_job_locked()

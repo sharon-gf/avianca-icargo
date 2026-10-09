@@ -586,6 +586,12 @@
             { country: "United States", airports: ["MIA"] }
         ];
         const MAX_RANGE_DAYS = 15;
+        // TRF007: up to 30 days (the server downloads them in 15-day parts)
+        const TRF007_MAX_RANGE_DAYS = 30;
+
+        function maxRangeDays() {
+            return currentModule() === "TRF007" ? TRF007_MAX_RANGE_DAYS : MAX_RANGE_DAYS;
+        }
         const logTimeFormatter = new Intl.DateTimeFormat([], {
             hour: "2-digit",
             minute: "2-digit",
@@ -622,7 +628,7 @@
 
             const startDate = new Date(startInput.value + "T00:00:00");
             endInput.min = startInput.value;
-            endInput.max = toInputDate(addDays(startDate, MAX_RANGE_DAYS));
+            endInput.max = toInputDate(addDays(startDate, maxRangeDays()));
 
             if (currentModule() === "CAP142" && currentCap142Mode() === "specific_flight") {
                 endInput.value = startInput.value;
@@ -810,6 +816,8 @@
             updateOriginSelectionView();
             syncAllCountryCheckboxes();
             updateSelectedCount();
+            // TRF007 allows 30 days, CAP142 15: refresh the "To" limit
+            syncDateLimits();
         }
 
         function setOriginSelection(checked) {
@@ -917,7 +925,7 @@
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
-                        "X-Client-Version": "job-api-v2"
+                        "X-Client-Version": "job-api-v3"
                     },
                     body: JSON.stringify(payload)
                 });
@@ -958,7 +966,7 @@
             try {
                 const response = await fetch(`/api/jobs/${activeJobId}/cancel`, {
                     method: "POST",
-                    headers: { "X-Client-Version": "job-api-v2" }
+                    headers: { "X-Client-Version": "job-api-v3" }
                 });
                 const job = await response.json();
                 if (!response.ok) {

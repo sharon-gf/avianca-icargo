@@ -75,7 +75,12 @@ DEFAULT_AIRPORTS = [
     "SDQ",
 ]
 
+# iCargo refuses one TRF007/CAP142 query longer than this many days.
 MAX_RANGE_DAYS = 15
+# TRF007 jobs may ask for up to this many days: the range is split into
+# MAX_RANGE_DAYS chunks, every chunk is queried for every airport (one login),
+# and all exports are merged into the same workbook as before.
+TRF007_MAX_TOTAL_DAYS = 30
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
 DOWNLOADER_BUILD_VERSION = "job-api-v34-cap142-country-origin"
@@ -279,6 +284,35 @@ def validate_date_range(start_date: str | date | None, end_date: str | date | No
         raise ValueError(f"Date range cannot exceed {MAX_RANGE_DAYS} days")
 
     return format_icargo_date(start), format_icargo_date(end)
+
+
+def split_date_range(
+    start_date: str | date | None,
+    end_date: str | date | None,
+    max_total_days: int = TRF007_MAX_TOTAL_DAYS,
+    chunk_days: int = MAX_RANGE_DAYS,
+) -> list[tuple[str, str]]:
+    """Validate a range of up to max_total_days and split it into consecutive,
+    non-overlapping chunks that iCargo accepts ((end - start).days <= chunk_days,
+    the same rule as validate_date_range). Returns iCargo-formatted dates.
+    A range that already fits returns a single chunk, so short jobs run
+    exactly as before."""
+    start = parse_iso_date(start_date or date.today())
+    end = parse_iso_date(end_date or (start + timedelta(days=chunk_days)))
+
+    days = (end - start).days
+    if days < 0:
+        raise ValueError("End date must be on or after start date")
+    if days > max_total_days:
+        raise ValueError(f"Date range cannot exceed {max_total_days} days")
+
+    chunks = []
+    chunk_start = start
+    while chunk_start <= end:
+        chunk_end = min(chunk_start + timedelta(days=chunk_days), end)
+        chunks.append((format_icargo_date(chunk_start), format_icargo_date(chunk_end)))
+        chunk_start = chunk_end + timedelta(days=1)
+    return chunks
 
 
 def find_chrome_binary() -> str | None:
@@ -1814,7 +1848,7 @@ def merge_excel_files(
     for excel_file in excel_files:
         try:
             df = pd.read_excel(excel_file)
-            source_match = re.match(r"^\d{2}_([A-Z0-9]{2,8})_", excel_file.name)
+            source_match = re.match(r"^\d{2,3}_([A-Z0-9]{2,8})_", excel_file.name)
             if source_match:
                 inferred_source = source_match.group(1)
                 if inferred_source != "BLANK":
@@ -1845,7 +1879,7 @@ def merge_excel_files(
 
 
 def source_from_export_filename(file_path: str | Path) -> str | None:
-    match = re.match(r"^\d{2}_([A-Z0-9]{2,8})_", Path(file_path).name)
+    match = re.match(r"^\d{2,3}_([A-Z0-9]{2,8})_", Path(file_path).name)
     if match:
         inferred_source = match.group(1)
         if inferred_source == "BLANK":
@@ -2807,7 +2841,8 @@ def run_download_workflow(
     config.validate()
 
     selected_airports = normalize_airports(airports)
-    icargo_start_date, icargo_end_date = validate_date_range(start_date, end_date)
+    date_chunks = split_date_range(start_date, end_date)
+    icargo_start_date, icargo_end_date = date_chunks[0][0], date_chunks[-1][1]
     config.download_dir.mkdir(parents=True, exist_ok=True)
     debug_dir = config.download_dir.parent / "debug"
 
@@ -2821,6 +2856,14 @@ def run_download_workflow(
         emit(progress_callback, "Starting Avianca TRF007 download", 3)
         emit(progress_callback, f"Airports selected: {', '.join(selected_airports)}", 5)
         emit(progress_callback, f"Date range: {icargo_start_date} to {icargo_end_date}", 6)
+        if len(date_chunks) > 1:
+            emit(
+                progress_callback,
+                f"iCargo allows {MAX_RANGE_DAYS} days per query: downloading in {len(date_chunks)} parts ("
+                + "; ".join(f"{chunk_start} to {chunk_end}" for chunk_start, chunk_end in date_chunks)
+                + ")",
+                6,
+            )
 
         driver = prepare_icargo_session(
             config=config,
@@ -2831,10 +2874,23 @@ def run_download_workflow(
         )
 
         total_airports = len(selected_airports)
-        for index, airport in enumerate(selected_airports, start=1):
+        # every (date part, airport) pair is one iCargo query; with one part
+        # this is exactly the old airport loop
+        work_items = [
+            (chunk_number, chunk_start_date, chunk_end_date, airport_number, airport)
+            for chunk_number, (chunk_start_date, chunk_end_date) in enumerate(date_chunks, start=1)
+            for airport_number, airport in enumerate(selected_airports, start=1)
+        ]
+        total_steps = len(work_items)
+        # index is unique across all parts, so every export keeps its own file name
+        for index, (chunk_number, chunk_start_date, chunk_end_date, airport_number, airport) in enumerate(work_items, start=1):
             check_cancelled(cancel_callback)
-            base_progress = 30 + int(((index - 1) / total_airports) * 50)
-            emit(progress_callback, f"Processing {airport} ({index}/{total_airports})", base_progress)
+            part_label = (
+                f" [part {chunk_number}/{len(date_chunks)}: {chunk_start_date} to {chunk_end_date}]"
+                if len(date_chunks) > 1 else ""
+            )
+            base_progress = 30 + int(((index - 1) / total_steps) * 50)
+            emit(progress_callback, f"Processing {airport} ({airport_number}/{total_airports}){part_label}", base_progress)
 
             downloaded_file = None
             last_failure = "download did not complete"
@@ -2857,8 +2913,8 @@ def run_download_workflow(
                     driver,
                     airport,
                     is_first_airport=True,
-                    start_date=icargo_start_date,
-                    end_date=icargo_end_date,
+                    start_date=chunk_start_date,
+                    end_date=chunk_end_date,
                     cancel_callback=cancel_callback,
                 ):
                     last_failure = "failed to set query parameters"
@@ -2892,12 +2948,12 @@ def run_download_workflow(
 
             if not downloaded_file:
                 failed_downloads += 1
-                emit(progress_callback, f"{airport}: {last_failure}", base_progress)
+                emit(progress_callback, f"{airport}: {last_failure}{part_label}", base_progress)
                 continue
 
             downloaded_file = rename_airport_export(downloaded_file, airport, index)
             successful_downloads += 1
-            emit(progress_callback, f"{airport}: downloaded {downloaded_file.name}", base_progress + 3)
+            emit(progress_callback, f"{airport}: downloaded {downloaded_file.name}{part_label}", base_progress + 3)
             for _ in range(4):
                 check_cancelled(cancel_callback)
                 time.sleep(0.5)
@@ -2963,7 +3019,7 @@ def main() -> None:
     run_parser = subparsers.add_parser("run", help="Run a download immediately")
     run_parser.add_argument("--airports", help="Comma-separated airport codes. Defaults to all configured airports.")
     run_parser.add_argument("--start-date", help="Start date in YYYY-MM-DD format. Defaults to today.")
-    run_parser.add_argument("--end-date", help="End date in YYYY-MM-DD format. Defaults to start date + 15 days.")
+    run_parser.add_argument("--end-date", help="End date in YYYY-MM-DD format. Defaults to start date + 15 days. Up to 30 days (downloaded in 15-day parts).")
     run_parser.add_argument("--download-dir", help="Folder for exports and merged file.")
     run_parser.add_argument("--upload-dropbox", action="store_true", help="Upload the merged file to Dropbox.")
     run_parser.add_argument("--send-email", action="store_true", help="Send completion/failure email notification.")
