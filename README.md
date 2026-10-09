@@ -104,7 +104,7 @@ If real Gmail, Avianca, or Dropbox credentials were ever committed or shared, ro
 
 ## Notes
 
-- TRF007 is limited to a 15-day date range.
+- iCargo limits each TRF007 query to 15 days. The app accepts up to 30 days for TRF007: it splits the range into 15-day parts, queries every airport for each part (one login) and merges everything into the same workbook. CAP142 stays limited to 15 days.
 - Only one job runs at a time because the same account/MFA inbox is shared.
 - Abort is cooperative: it stops at the next safe browser/email/download checkpoint.
 - A cold Railway container or first Microsoft verification challenge may fail once; the app retries that setup stage automatically.
