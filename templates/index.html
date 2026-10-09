@@ -617,7 +617,17 @@
         function initDates() {
             const today = new Date();
             document.getElementById("startDate").value = toInputDate(today);
-            document.getElementById("endDate").value = toInputDate(addDays(today, MAX_RANGE_DAYS));
+            setFullRangeEndDate();
+        }
+
+        // "To" follows "From": always the longest range the module allows
+        // (30 days TRF007, 15 days CAP142). It can still be shortened by hand.
+        function setFullRangeEndDate() {
+            const startInput = document.getElementById("startDate");
+            if (startInput.value) {
+                const startDate = new Date(startInput.value + "T00:00:00");
+                document.getElementById("endDate").value = toInputDate(addDays(startDate, maxRangeDays()));
+            }
             syncDateLimits();
         }
 
@@ -816,8 +826,8 @@
             updateOriginSelectionView();
             syncAllCountryCheckboxes();
             updateSelectedCount();
-            // TRF007 allows 30 days, CAP142 15: refresh the "To" limit
-            syncDateLimits();
+            // TRF007 allows 30 days, CAP142 15: move "To" to the full range
+            setFullRangeEndDate();
         }
 
         function setOriginSelection(checked) {
@@ -1129,7 +1139,7 @@
             setOriginSelection(false);
         });
 
-        document.getElementById("startDate").addEventListener("change", syncDateLimits);
+        document.getElementById("startDate").addEventListener("change", setFullRangeEndDate);
         document.getElementById("module").addEventListener("change", updateModuleView);
         document.getElementById("cap142Mode").addEventListener("change", updateModuleView);
         document.getElementById("cap142OriginType").addEventListener("change", updateModuleView);
