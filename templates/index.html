@@ -586,11 +586,14 @@
             { country: "United States", airports: ["MIA"] }
         ];
         const MAX_RANGE_DAYS = 15;
-        // TRF007: up to 30 days (the server downloads them in 15-day parts)
+        // TRF007 and CAP142 booking period: up to 30 days (the server downloads
+        // them in 15-day parts). CAP142 specific flight keeps 15.
         const TRF007_MAX_RANGE_DAYS = 30;
 
         function maxRangeDays() {
-            return currentModule() === "TRF007" ? TRF007_MAX_RANGE_DAYS : MAX_RANGE_DAYS;
+            const longRange = currentModule() === "TRF007"
+                || (currentModule() === "CAP142" && currentCap142Mode() === "booking_period");
+            return longRange ? TRF007_MAX_RANGE_DAYS : MAX_RANGE_DAYS;
         }
         const logTimeFormatter = new Intl.DateTimeFormat([], {
             hour: "2-digit",
