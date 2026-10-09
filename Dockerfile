@@ -1,4 +1,7 @@
-FROM python:3.11-slim
+# Same official python:3.11-slim image, pulled from the AWS public mirror of
+# Docker Hub's official images: Railway builds failed on 2026-10-09 with
+# "failed to fetch oauth token" from docker.io (Docker Hub auth/rate limit).
+FROM public.ecr.aws/docker/library/python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1
 ENV CHROME_BIN=/usr/bin/chromium
