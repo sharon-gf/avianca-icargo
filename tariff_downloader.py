@@ -77,9 +77,10 @@ DEFAULT_AIRPORTS = [
 
 # iCargo refuses one TRF007/CAP142 query longer than this many days.
 MAX_RANGE_DAYS = 15
-# TRF007 jobs may ask for up to this many days: the range is split into
-# MAX_RANGE_DAYS chunks, every chunk is queried for every airport (one login),
-# and all exports are merged into the same workbook as before.
+# TRF007 and CAP142 booking-period jobs may ask for up to this many days: the
+# range is split into MAX_RANGE_DAYS chunks, every chunk is queried for every
+# origin (one login), and all exports are merged into the same workbook as
+# before. CAP142 specific flight keeps the single-query limit.
 TRF007_MAX_TOTAL_DAYS = 30
 LOGIN_URL = "https://avianca-icargo.ibsplc.aero/icargo/login.do"
 VERIFICATION_CODE_SENDER = "account-security-noreply@accountprotection.microsoft.com"
@@ -2523,9 +2524,13 @@ def run_cap142_workflow(
     if mode == "specific_flight" and not flight_number:
         raise ValueError("Flight number is required for CAP142 specific flight")
 
-    icargo_start_date, icargo_end_date = validate_date_range(start_date, end_date)
-    icargo_start_date = format_cap142_date(icargo_start_date)
-    icargo_end_date = format_cap142_date(icargo_end_date)
+    if mode == "booking_period":
+        # same as TRF007: up to 30 days, queried in iCargo-sized parts
+        date_chunks = split_date_range(start_date, end_date)
+    else:
+        date_chunks = [validate_date_range(start_date, end_date)]
+    date_chunks = [(format_cap142_date(chunk_start), format_cap142_date(chunk_end)) for chunk_start, chunk_end in date_chunks]
+    icargo_start_date, icargo_end_date = date_chunks[0][0], date_chunks[-1][1]
     config.download_dir.mkdir(parents=True, exist_ok=True)
     debug_dir = config.download_dir.parent / "debug"
 
@@ -2545,6 +2550,14 @@ def run_cap142_workflow(
         else:
             emit(progress_callback, f"Mode: booking period for AWB prefix {awb_prefix}", 4)
             emit(progress_callback, f"Booking date range: {icargo_start_date} to {icargo_end_date}", 5)
+            if len(date_chunks) > 1:
+                emit(
+                    progress_callback,
+                    f"iCargo allows {MAX_RANGE_DAYS} days per query: downloading in {len(date_chunks)} parts ("
+                    + "; ".join(f"{chunk_start} to {chunk_end}" for chunk_start, chunk_end in date_chunks)
+                    + ")",
+                    5,
+                )
         emit(progress_callback, f"Origin type: {origin_type}", 6)
         origin_summary = ", ".join(origin_display_name(origin) for origin in selected_origins)
         emit(progress_callback, f"Origins selected: {origin_summary}", 6)
@@ -2563,12 +2576,25 @@ def run_cap142_workflow(
         )
 
         total_origins = len(selected_origins)
-        for index, origin in enumerate(selected_origins, start=1):
+        # every (date part, origin) pair is one iCargo query; with one part
+        # this is exactly the old origin loop
+        work_items = [
+            (chunk_number, chunk_start_date, chunk_end_date, origin_number, origin)
+            for chunk_number, (chunk_start_date, chunk_end_date) in enumerate(date_chunks, start=1)
+            for origin_number, origin in enumerate(selected_origins, start=1)
+        ]
+        total_steps = len(work_items)
+        # index is unique across all parts, so every export keeps its own file name
+        for index, (chunk_number, chunk_start_date, chunk_end_date, origin_number, origin) in enumerate(work_items, start=1):
             check_cancelled(cancel_callback)
             origin_label = origin_display_name(origin)
             origin_code = origin_file_code(origin)
-            base_progress = 30 + int(((index - 1) / total_origins) * 50)
-            emit(progress_callback, f"Processing {origin_label} ({index}/{total_origins})", base_progress)
+            part_label = (
+                f" [part {chunk_number}/{len(date_chunks)}: {chunk_start_date} to {chunk_end_date}]"
+                if len(date_chunks) > 1 else ""
+            )
+            base_progress = 30 + int(((index - 1) / total_steps) * 50)
+            emit(progress_callback, f"Processing {origin_label} ({origin_number}/{total_origins}){part_label}", base_progress)
 
             downloaded_file = None
             last_failure = "download did not complete"
@@ -2592,8 +2618,8 @@ def run_cap142_workflow(
                     mode=mode,
                     origin=origin,
                     origin_type=origin_type,
-                    start_date=icargo_start_date,
-                    end_date=icargo_end_date,
+                    start_date=chunk_start_date,
+                    end_date=chunk_end_date,
                     awb_prefix=awb_prefix,
                     flight_carrier=flight_carrier,
                     flight_number=flight_number,
@@ -2634,16 +2660,16 @@ def run_cap142_workflow(
 
             if not downloaded_file:
                 failed_downloads += 1
-                emit(progress_callback, f"{origin_label}: {last_failure}", base_progress)
+                emit(progress_callback, f"{origin_label}: {last_failure}{part_label}", base_progress)
                 continue
 
             downloaded_file = rename_airport_export(downloaded_file, origin_code, index)
             downloaded_files.append(downloaded_file)
             successful_downloads += 1
             if origin:
-                emit(progress_callback, f"{origin_label}: downloaded {downloaded_file.name}", base_progress + 3)
+                emit(progress_callback, f"{origin_label}: downloaded {downloaded_file.name}{part_label}", base_progress + 3)
             else:
-                emit(progress_callback, f"{origin_label}: downloaded CAP142 Excel", base_progress + 3)
+                emit(progress_callback, f"{origin_label}: downloaded CAP142 Excel{part_label}", base_progress + 3)
             for _ in range(4):
                 check_cancelled(cancel_callback)
                 time.sleep(0.5)

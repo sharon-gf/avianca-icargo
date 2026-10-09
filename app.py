@@ -50,8 +50,9 @@ DEFAULT_AIRPORTS = [
 ]
 CAP142_COUNTRY_ORIGINS = {"CN", "HK", "TW", "JP", "KR", "VN", "ID"}
 MAX_RANGE_DAYS = 15
-# TRF007 accepts up to 30 days; tariff_downloader splits them into 15-day
-# iCargo queries and merges the exports. CAP142 keeps the 15-day limit.
+# TRF007 and CAP142 booking period accept up to 30 days; tariff_downloader
+# splits them into 15-day iCargo queries and merges the exports. CAP142
+# specific flight keeps the 15-day limit.
 TRF007_MAX_RANGE_DAYS = 30
 
 
@@ -77,7 +78,7 @@ def create_job_executor() -> ThreadPoolExecutor:
 
 EXECUTOR = create_job_executor()
 CLIENT_VERSION = "job-api-v3"
-APP_BUILD_VERSION = "job-api-v26-trf007-30-days"
+APP_BUILD_VERSION = "job-api-v27-cap142-30-days"
 
 
 def now_iso() -> str:
@@ -618,7 +619,8 @@ def start_download():
         days = (end - start).days
         if days < 0:
             return jsonify({"error": "End date must be on or after start date"}), 400
-        max_range_days = TRF007_MAX_RANGE_DAYS if module == "TRF007" else MAX_RANGE_DAYS
+        long_range = module == "TRF007" or (module == "CAP142" and cap142_mode == "booking_period")
+        max_range_days = TRF007_MAX_RANGE_DAYS if long_range else MAX_RANGE_DAYS
         if days > max_range_days:
             return jsonify({"error": f"Date range cannot exceed {max_range_days} days"}), 400
 
